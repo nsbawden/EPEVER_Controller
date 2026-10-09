@@ -1,0 +1,33 @@
+*.iml
+.gradle/
+.kotlin/
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Generated build output
+**/build/
+*.apk
+*.ap_
+*.aab
+
+
+# JVM crash dumps
+*.hprof
+
+# Local signing material
+*.jks
+*.keystore
+
+# Synced phone logs and generated charts (synclogs.bat / syncall.ps1)
+/pulled_logs/

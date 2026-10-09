@@ -1,0 +1,36 @@
+---
+description: After app code changes, deploy to the phone and relaunch EMPPT
+alwaysApply: true
+---
+
+# Phone deploy and relaunch
+
+When you change anything that affects the Android app (Kotlin, Compose UI, resources, manifest, `app/build.gradle`, etc.), **do not stop at compile-only**. Deploy and relaunch on the connected phone before considering the task done.
+
+## When to deploy
+
+Deploy after any task that modifies app behavior or UI, including bug fixes, new settings, controller logic, and logging changes.
+
+Skip deploy only when:
+- The change is docs/scripts/sync only (no APK impact), or
+- No device is connected (`adb devices` empty) — say so and offer to deploy when a device is available, or
+- The user explicitly asked not to install.
+
+## Steps
+
+From the project root:
+
+1. Confirm a device is connected:
+   ```powershell
+   adb devices
+   ```
+2. Build and install:
+   ```powershell
+   .\gradlew.bat installDebug
+   ```
+3. **Always relaunch after install.** `installDebug` replaces the APK but does not open the app; the launcher name is **EMPPT**.
+   ```powershell
+   adb shell am start -n com.example.emppt/com.example.ridenbmscontroller.MainActivity
+   ```
+
+If install fails, fix the build error and retry. Do not tell the user to check the phone until deploy + relaunch have succeeded (or you have reported why they could not run).
