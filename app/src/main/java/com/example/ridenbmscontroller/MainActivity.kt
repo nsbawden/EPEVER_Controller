@@ -70,6 +70,7 @@ import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
 import com.example.ridenbmscontroller.logging.OpsTelemetrySample
 import com.example.ridenbmscontroller.model.PowerDirection
 import com.example.ridenbmscontroller.model.MpptState
+import com.example.ridenbmscontroller.epever.EpeverBatteryProfile
 import com.example.ridenbmscontroller.epever.EpeverUsbMonitor
 import com.example.ridenbmscontroller.epever.EpeverUsbState
 import com.example.ridenbmscontroller.ui.screens.DashboardScreen
@@ -101,6 +102,8 @@ class MainActivity : ComponentActivity() {
     private var bmsBleState by mutableStateOf(BmsBleUiState())
     private var epeverUsbState by mutableStateOf(EpeverUsbState())
     private var appSettings by mutableStateOf(AppState.preview.settings)
+    private var unattendedProfile by mutableStateOf(EpeverBatteryProfile())
+    private var batteryProfileStatus by mutableStateOf("Not read yet")
     private var mpptControlState by mutableStateOf(MpptControlState())
     private var energyCounters by mutableStateOf(AppState.preview.energy)
     private var energyDayKey = 0
@@ -191,6 +194,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         appSettings = loadSettings()
+        unattendedProfile = loadUnattendedProfile()
         opsLogger = OpsLogger(filesDir)
         refreshOpsLogSummary()
         if (appSettings.logEventsEnabled) {
@@ -210,7 +214,7 @@ class MainActivity : ComponentActivity() {
             epeverUsbState = it
             historyAccumulator.addEpever(it)
             updateDailyHealthFromMppt(it.telemetry.chargeAmps, it.telemetry.fault)
-            if (it.telemetry.generatedWhToday > 0.0) {
+            if (it.connected) {
                 energyCounters = energyCounters.copy(
                     currentWatts = it.telemetry.chargeWatts,
                     whToday = it.telemetry.generatedWhToday,
@@ -295,10 +299,16 @@ class MainActivity : ComponentActivity() {
                     balanceDayToday = isBalanceDayToday(appSettings),
                     daysUntilNextBalance = daysUntilNextBalance(appSettings),
                     onToggleBalanceToday = { toggleBalanceToday() },
-                    onResetEnergyTotal = { resetEnergyTotal() },
+                    onClearEpeverEnergy = { clearEpeverGeneratedEnergy() },
                     onResetSocDrift = { resetSocDriftManual() },
                     onDeleteOpsLogsBeforeDate = { cutoff -> deleteOpsLogsBeforeDate(cutoff) },
                     onRefreshOpsLogSummary = { refreshOpsLogSummary() },
+                    unattendedProfile = unattendedProfile,
+                    batteryProfileStatus = batteryProfileStatus,
+                    onRefreshBatteryProfile = { refreshBatteryProfileFromEpever() },
+                    onUnattendedModeChanged = { setUnattendedMode(it) },
+                    onBatteryProfileChanged = { profile, write -> updateBatteryProfile(profile, write) },
+                    onSyncEpeverClock = { syncEpeverClockFromPhone() },
                     onDismissLogStorageWarning = {
                         logStorageWarningDismissed = true
                         logStorageWarning = null
@@ -339,13 +349,16 @@ class MainActivity : ComponentActivity() {
 
     private fun updateUsbAlarm(connected: Boolean) {
         if (connected) {
-            if (!hadGoodEpeverConnection) addControllerEvent("EPEVER USB connected")
+            if (!hadGoodEpeverConnection) {
+                addControllerEvent("EPEVER USB connected")
+                if (appSettings.unattendedMode) writeUnattendedProfile(chargeOn = true)
+            }
             hadGoodEpeverConnection = true
             stopUsbAlarm()
             publishAlerts()
             return
         }
-        if (hadGoodEpeverConnection) {
+        if (hadGoodEpeverConnection && !appSettings.unattendedMode) {
             if (usbAlarmJob == null) addControllerEvent("EPEVER USB disconnected")
             startUsbAlarmIfNeeded()
         }
@@ -765,12 +778,18 @@ class MainActivity : ComponentActivity() {
     private fun loadSettings(): AppSettings {
         val defaults = AppState.preview.settings
         val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_CONTROLLER_ON_MIGRATED, false)) {
+            prefs.edit {
+                putBoolean(KEY_CONTROLLER_ON_MIGRATED, true)
+                putBoolean(KEY_CONTROLLER_ENABLED, true)
+            }
+        }
         return AppSettings(
             maxBatteryVolts = prefs.getFloat(KEY_MAX_BATTERY_V, defaults.maxBatteryVolts.toFloat()).toDouble(),
             bmsOfflineMaxBatteryVolts = prefs.getFloat(KEY_BMS_OFFLINE_MAX_BATTERY_V, defaults.bmsOfflineMaxBatteryVolts.toFloat()).toDouble(),
             balanceEveryDays = prefs.getInt(KEY_BALANCE_EVERY_DAYS, defaults.balanceEveryDays),
             lastBalanceEpochDay = prefs.getLong(KEY_LAST_BALANCE_EPOCH_DAY, defaults.lastBalanceEpochDay),
-            controllerEnabled = prefs.getBoolean(KEY_CONTROLLER_ENABLED, defaults.controllerEnabled),
+            controllerEnabled = prefs.getBoolean(KEY_CONTROLLER_ENABLED, true),
             normalSocCeilingPercent = prefs.getInt(KEY_NORMAL_SOC_CEILING_PERCENT, defaults.normalSocCeilingPercent).coerceIn(50, 100),
             normalSocResumePercent = prefs.getInt(KEY_NORMAL_SOC_RESUME_PERCENT, defaults.normalSocResumePercent).coerceIn(50, 99),
             bmsCurrentDeadbandAmps = prefs.getFloat(KEY_BMS_CURRENT_DEADBAND_A, defaults.bmsCurrentDeadbandAmps.toFloat()).toDouble(),
@@ -783,7 +802,8 @@ class MainActivity : ComponentActivity() {
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn),
             logEventsEnabled = prefs.getBoolean(KEY_LOG_EVENTS_ENABLED, defaults.logEventsEnabled),
             logTelemetryEnabled = prefs.getBoolean(KEY_LOG_TELEMETRY_ENABLED, defaults.logTelemetryEnabled),
-            logHistoryEnabled = prefs.getBoolean(KEY_LOG_HISTORY_ENABLED, defaults.logHistoryEnabled)
+            logHistoryEnabled = prefs.getBoolean(KEY_LOG_HISTORY_ENABLED, defaults.logHistoryEnabled),
+            unattendedMode = prefs.getBoolean(KEY_UNATTENDED_MODE, defaults.unattendedMode)
         )
     }
 
@@ -807,6 +827,139 @@ class MainActivity : ComponentActivity() {
             putBoolean(KEY_LOG_EVENTS_ENABLED, settings.logEventsEnabled)
             putBoolean(KEY_LOG_TELEMETRY_ENABLED, settings.logTelemetryEnabled)
             putBoolean(KEY_LOG_HISTORY_ENABLED, settings.logHistoryEnabled)
+            putBoolean(KEY_UNATTENDED_MODE, settings.unattendedMode)
+        }
+    }
+
+    private fun loadUnattendedProfile(): EpeverBatteryProfile {
+        val defaults = EpeverBatteryProfile()
+        val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+        return EpeverBatteryProfile(
+            batteryType = prefs.getInt(KEY_BP_TYPE, defaults.batteryType),
+            capacityAh = prefs.getInt(KEY_BP_CAPACITY, defaults.capacityAh),
+            tempCompensationMvv = prefs.getFloat(KEY_BP_TEMP, defaults.tempCompensationMvv.toFloat()).toDouble(),
+            highVoltageDisconnect = prefs.getFloat(KEY_BP_HVD, defaults.highVoltageDisconnect.toFloat()).toDouble(),
+            chargingLimitVolts = prefs.getFloat(KEY_BP_LIMIT, defaults.chargingLimitVolts.toFloat()).toDouble(),
+            overVoltageReconnect = prefs.getFloat(KEY_BP_OVR, defaults.overVoltageReconnect.toFloat()).toDouble(),
+            equalizeVolts = prefs.getFloat(KEY_BP_EQ, defaults.equalizeVolts.toFloat()).toDouble(),
+            boostVolts = prefs.getFloat(KEY_BP_BOOST, defaults.boostVolts.toFloat()).toDouble(),
+            floatVolts = prefs.getFloat(KEY_BP_FLOAT, defaults.floatVolts.toFloat()).toDouble(),
+            boostReconnectVolts = prefs.getFloat(KEY_BP_BOOST_RE, defaults.boostReconnectVolts.toFloat()).toDouble(),
+            lowVoltageReconnect = prefs.getFloat(KEY_BP_LVR, defaults.lowVoltageReconnect.toFloat()).toDouble(),
+            underVoltageRecover = prefs.getFloat(KEY_BP_UVR, defaults.underVoltageRecover.toFloat()).toDouble(),
+            underVoltageWarning = prefs.getFloat(KEY_BP_UVW, defaults.underVoltageWarning.toFloat()).toDouble(),
+            lowVoltageDisconnect = prefs.getFloat(KEY_BP_LVD, defaults.lowVoltageDisconnect.toFloat()).toDouble(),
+            dischargingLimitVolts = prefs.getFloat(KEY_BP_DLV, defaults.dischargingLimitVolts.toFloat()).toDouble()
+        )
+    }
+
+    private fun saveUnattendedProfile(profile: EpeverBatteryProfile) {
+        getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit {
+            putInt(KEY_BP_TYPE, profile.batteryType)
+            putInt(KEY_BP_CAPACITY, profile.capacityAh)
+            putFloat(KEY_BP_TEMP, profile.tempCompensationMvv.toFloat())
+            putFloat(KEY_BP_HVD, profile.highVoltageDisconnect.toFloat())
+            putFloat(KEY_BP_LIMIT, profile.chargingLimitVolts.toFloat())
+            putFloat(KEY_BP_OVR, profile.overVoltageReconnect.toFloat())
+            putFloat(KEY_BP_EQ, profile.equalizeVolts.toFloat())
+            putFloat(KEY_BP_BOOST, profile.boostVolts.toFloat())
+            putFloat(KEY_BP_FLOAT, profile.floatVolts.toFloat())
+            putFloat(KEY_BP_BOOST_RE, profile.boostReconnectVolts.toFloat())
+            putFloat(KEY_BP_LVR, profile.lowVoltageReconnect.toFloat())
+            putFloat(KEY_BP_UVR, profile.underVoltageRecover.toFloat())
+            putFloat(KEY_BP_UVW, profile.underVoltageWarning.toFloat())
+            putFloat(KEY_BP_LVD, profile.lowVoltageDisconnect.toFloat())
+            putFloat(KEY_BP_DLV, profile.dischargingLimitVolts.toFloat())
+        }
+    }
+
+    private fun syncEpeverClockFromPhone() {
+        if (!epeverUsbState.connected) {
+            batteryProfileStatus = "EPEVER disconnected"
+            return
+        }
+        batteryProfileStatus = "Setting EPEVER clock..."
+        epeverUsbMonitor.writeClockFromPhone { result ->
+            result.onSuccess { clock ->
+                batteryProfileStatus = "Clock set to ${clock.format()}"
+                addControllerEvent("EPEVER clock synced to phone")
+            }.onFailure { error ->
+                batteryProfileStatus = "Clock set failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun refreshBatteryProfileFromEpever() {
+        if (!epeverUsbState.connected) {
+            batteryProfileStatus = "EPEVER disconnected"
+            return
+        }
+        batteryProfileStatus = "Reading EPEVER..."
+        epeverUsbMonitor.readBatteryProfile { result ->
+            result.onSuccess { device ->
+                unattendedProfile = if (appSettings.unattendedMode) {
+                    device
+                } else {
+                    unattendedProfile.mergeKeepingLiveOverlay(device)
+                }
+                saveUnattendedProfile(unattendedProfile)
+                batteryProfileStatus = "Read from EPEVER"
+            }.onFailure { error ->
+                batteryProfileStatus = "Read failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun updateBatteryProfile(profile: EpeverBatteryProfile, writeToEpever: Boolean) {
+        unattendedProfile = profile
+        saveUnattendedProfile(profile)
+        if (!writeToEpever) return
+        if (appSettings.unattendedMode) {
+            writeUnattendedProfile(chargeOn = false)
+        } else {
+            writeProtectionParams(profile)
+        }
+    }
+
+    private fun setUnattendedMode(unattended: Boolean) {
+        if (appSettings.unattendedMode == unattended) return
+        appSettings = appSettings.copy(unattendedMode = unattended)
+        saveSettings(appSettings)
+        if (unattended) {
+            addControllerEvent("Unattended mode")
+            writeUnattendedProfile(chargeOn = true)
+        } else {
+            addControllerEvent("Live mode")
+            batteryProfileStatus = "Live control resumed"
+        }
+        tickController()
+    }
+
+    private fun writeUnattendedProfile(chargeOn: Boolean) {
+        if (!epeverUsbState.connected) {
+            batteryProfileStatus = "Will write when EPEVER reconnects"
+            return
+        }
+        batteryProfileStatus = "Writing unattended profile..."
+        epeverUsbMonitor.writeBatteryProfile(unattendedProfile) { result ->
+            result.onSuccess {
+                if (chargeOn) epeverUsbMonitor.setCharging(true)
+                batteryProfileStatus = "Unattended profile written"
+                addControllerEvent("EPEVER unattended profile written")
+            }.onFailure { error ->
+                batteryProfileStatus = "Write failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun writeProtectionParams(profile: EpeverBatteryProfile) {
+        if (!epeverUsbState.connected) return
+        epeverUsbMonitor.writeProtectionParams(profile) { result ->
+            result.onSuccess {
+                batteryProfileStatus = "Protection parameters written"
+            }.onFailure { error ->
+                batteryProfileStatus = "Write failed: ${error.message ?: error.javaClass.simpleName}"
+            }
         }
     }
 
@@ -945,9 +1098,22 @@ class MainActivity : ComponentActivity() {
         maybePersistEnergy(nowMs)
     }
 
-    private fun resetEnergyTotal() {
-        energyCounters = energyCounters.copy(whTotal = 0.0)
-        persistEnergy()
+    private fun clearEpeverGeneratedEnergy() {
+        if (!epeverUsbState.connected) {
+            batteryProfileStatus = "EPEVER disconnected"
+            return
+        }
+        batteryProfileStatus = "Clearing generated energy..."
+        epeverUsbMonitor.clearGeneratedEnergy { result ->
+            result.onSuccess {
+                energyCounters = energyCounters.copy(whToday = 0.0, whTotal = 0.0)
+                persistEnergy()
+                batteryProfileStatus = "Generated energy cleared"
+                addControllerEvent("EPEVER generated energy cleared")
+            }.onFailure { error ->
+                batteryProfileStatus = "Energy clear failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
     }
 
     private fun rolloverEnergyDayIfNeeded(today: Int): Boolean {
@@ -1255,6 +1421,23 @@ class MainActivity : ComponentActivity() {
         private const val KEY_MAX_CHARGE_A = "max_charge_a"
         private const val KEY_TARGET_PV_V = "target_pv_v"
         private const val KEY_CONTROLLER_ENABLED = "controller_enabled"
+        private const val KEY_CONTROLLER_ON_MIGRATED = "controller_on_migrated"
+        private const val KEY_UNATTENDED_MODE = "unattended_mode"
+        private const val KEY_BP_TYPE = "bp_type"
+        private const val KEY_BP_CAPACITY = "bp_capacity"
+        private const val KEY_BP_TEMP = "bp_temp"
+        private const val KEY_BP_HVD = "bp_hvd"
+        private const val KEY_BP_LIMIT = "bp_limit"
+        private const val KEY_BP_OVR = "bp_ovr"
+        private const val KEY_BP_EQ = "bp_eq"
+        private const val KEY_BP_BOOST = "bp_boost"
+        private const val KEY_BP_FLOAT = "bp_float"
+        private const val KEY_BP_BOOST_RE = "bp_boost_re"
+        private const val KEY_BP_LVR = "bp_lvr"
+        private const val KEY_BP_UVR = "bp_uvr"
+        private const val KEY_BP_UVW = "bp_uvw"
+        private const val KEY_BP_LVD = "bp_lvd"
+        private const val KEY_BP_DLV = "bp_dlv"
         private const val KEY_MAX_CHARGE_PERCENT = "max_charge_percent"
         private const val KEY_MAX_SOC_TRICKLE_A = "max_soc_trickle_a"
         private const val KEY_NORMAL_SOC_CEILING_PERCENT = "normal_soc_ceiling_percent"
@@ -1466,10 +1649,16 @@ private fun EpeverApp(
     balanceDayToday: Boolean,
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
-    onResetEnergyTotal: () -> Unit,
+    onClearEpeverEnergy: () -> Unit,
     onResetSocDrift: () -> Unit,
     onDeleteOpsLogsBeforeDate: (String) -> String,
     onRefreshOpsLogSummary: () -> Unit,
+    unattendedProfile: EpeverBatteryProfile,
+    batteryProfileStatus: String,
+    onRefreshBatteryProfile: () -> Unit,
+    onUnattendedModeChanged: (Boolean) -> Unit,
+    onBatteryProfileChanged: (EpeverBatteryProfile, Boolean) -> Unit,
+    onSyncEpeverClock: () -> Unit,
     onDismissLogStorageWarning: () -> Unit,
     onSilenceLowSocAlarm: () -> Unit,
     onSilenceSocDriftAlarm: () -> Unit
@@ -1490,7 +1679,8 @@ private fun EpeverApp(
         averagePackCurrentA,
         barometricPressureInHg,
         gpsAltitudeMeters,
-        gpsAltitudeSampling
+        gpsAltitudeSampling,
+        unattendedProfile
     ) {
         AppState.preview.copy(
             settings = appSettings,
@@ -1514,7 +1704,9 @@ private fun EpeverApp(
                         socDriftAh = socDriftAh
                     ),
                     controller = base.controller.copy(
-                        averagePackCurrentA = averagePackCurrentA
+                        averagePackCurrentA = averagePackCurrentA,
+                        profileBoostVolts = unattendedProfile.boostVolts,
+                        profileFloatVolts = unattendedProfile.floatVolts
                     )
                 )
             }
@@ -1581,22 +1773,31 @@ private fun EpeverApp(
                 AppTab.Settings -> SettingsScreen(
                     settings = state.settings,
                     mppt = state.mppt,
-                    energy = state.energy,
                     socDriftAh = state.battery.socDriftAh,
                     worstCaseSocPercent = state.battery.worstCaseSocPercent,
                     onSettingsChanged = onSettingsChanged,
                     balanceDayToday = balanceDayToday,
                     daysUntilNextBalance = daysUntilNextBalance,
                     onToggleBalanceToday = onToggleBalanceToday,
-                    onResetEnergyTotal = onResetEnergyTotal,
                     onResetSocDrift = onResetSocDrift,
+                    opsLogSummary = state.opsLogSummary,
+                    onDeleteOpsLogsBeforeDate = onDeleteOpsLogsBeforeDate,
+                    onRefreshOpsLogSummary = onRefreshOpsLogSummary,
                     modifier = Modifier.padding(innerPadding)
                 )
                 AppTab.Tools -> ToolsScreen(
-                    state = state,
+                    unattendedMode = appSettings.unattendedMode,
+                    profile = unattendedProfile,
+                    epeverConnected = epeverUsbState.connected,
+                    epeverClock = epeverUsbState.clock,
+                    mppt = state.mppt,
+                    status = batteryProfileStatus,
                     modifier = Modifier.padding(innerPadding),
-                    onDeleteOpsLogsBeforeDate = onDeleteOpsLogsBeforeDate,
-                    onRefreshOpsLogSummary = onRefreshOpsLogSummary
+                    onRefreshFromEpever = onRefreshBatteryProfile,
+                    onUnattendedModeChanged = onUnattendedModeChanged,
+                    onProfileChanged = onBatteryProfileChanged,
+                    onSyncClockFromPhone = onSyncEpeverClock,
+                    onClearGeneratedEnergy = onClearEpeverEnergy
                 )
             }
         }
@@ -1639,6 +1840,8 @@ private fun AppState.withEpeverTelemetry(usbState: EpeverUsbState): AppState {
             chargeStage = telemetry.chargeStage,
             fault = telemetry.fault,
             generatedWhToday = telemetry.generatedWhToday,
+            generatedWhMonth = telemetry.generatedWhMonth,
+            generatedWhYear = telemetry.generatedWhYear,
             generatedWhTotal = telemetry.generatedWhTotal,
             voltageOffset = mppt.voltageOffset,
             commandCvVolts = mppt.commandCvVolts

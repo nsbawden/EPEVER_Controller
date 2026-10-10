@@ -36,6 +36,8 @@ class SolarMpptController(
     private var offsetEma = 0.0
     private var offsetReady = false
     private var holdEstSyncedThisVisit = false
+    private var lastSocTarget = 0
+    private var sawSocBelowTarget = false
     private var alarmHoldUntilMs = 0L
     private var alarmBackoffMs = ALARM_BASE_HOLD_MS
     private var lastAlarmStartMs = 0L
@@ -59,6 +61,24 @@ class SolarMpptController(
         val socPercent = bms.socPercent
         val batteryVolts = bms.packVoltage
 
+        if (settings.unattendedMode) {
+            holdEstSyncedThisVisit = false
+            wasInHold = false
+            lastCharging = null
+            publish(
+                settings = settings,
+                mode = MODE_UNATTENDED,
+                status = "Unattended: EPEVER running its battery profile",
+                commandCv = 0.0,
+                holdVolts = settings.bmsVoltageHoldVolts,
+                socTarget = if (isBalanceDay(settings)) 100 else settings.normalSocCeilingPercent,
+                chargingOn = epever.chargingOn,
+                epeverConnected = epeverState.connected,
+                bmsConnected = bmsReady
+            )
+            return
+        }
+
         if (!settings.controllerEnabled || !epeverState.connected) {
             holdEstSyncedThisVisit = false
             wasInHold = false
@@ -72,6 +92,12 @@ class SolarMpptController(
         }
         val socTarget = if (balanceDay) 100 else settings.normalSocCeilingPercent
         val holdVolts = if (socTarget >= 100) settings.fullHoldVolts else settings.bmsVoltageHoldVolts
+        if (socTarget > lastSocTarget && lastSocTarget > 0) {
+            wasInHold = false
+            holdEstSyncedThisVisit = false
+            sawSocBelowTarget = socPercent != null && socPercent < socTarget
+        }
+        lastSocTarget = socTarget
 
         if (bmsReady) {
             val alarms = bms.chargeBlockingAlarmNames
@@ -97,7 +123,7 @@ class SolarMpptController(
         val reachedSoc = soc != null && soc >= socTarget
         val resumeSoc = settings.normalSocResumePercent.coerceAtMost(socTarget - 1)
         val belowResume = soc != null && soc <= resumeSoc
-        if (!reachedSoc) holdEstSyncedThisVisit = false
+        if (soc != null && soc < socTarget) sawSocBelowTarget = true
 
         val wantHold = if (wasInHold) {
             bmsReady && !belowResume
@@ -126,10 +152,13 @@ class SolarMpptController(
         if (wantHold) {
             val cv = (holdVolts + filteredOffset()).coerceIn(12.40, bulkCeiling)
             maybeWriteProfile(EpeverVoltageProfile.hold(cv, bulkCeiling), cv, now)
-            if (!holdEstSyncedThisVisit) {
+            if (!holdEstSyncedThisVisit && reachedSoc) {
                 holdEstSyncedThisVisit = true
                 onEvent("Hold: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, MPPT offset ${"%+.2f".format(filteredOffset())}V")
-                onTopOffComplete(if (socTarget >= 100) "100% hold" else "SOC $socTarget% hold")
+                if (sawSocBelowTarget) {
+                    onTopOffComplete(if (socTarget >= 100) "100% hold" else "SOC $socTarget% hold")
+                    sawSocBelowTarget = false
+                }
             }
             wasInHold = true
             publish(
@@ -150,6 +179,7 @@ class SolarMpptController(
             onEvent("Hold exit: resume bulk at ${"%.2f".format(bulkCeiling)}V")
         }
         wasInHold = false
+        holdEstSyncedThisVisit = false
         maybeWriteProfile(EpeverVoltageProfile.bulk(bulkCeiling), bulkCeiling, now)
         val mode = if (bmsReady) MODE_BULK else MODE_VOLTAGE
         publish(
@@ -223,7 +253,6 @@ class SolarMpptController(
     }
 
     private fun idle(settings: AppSettings, epeverConnected: Boolean, bmsReady: Boolean, status: String) {
-        commandCharging(false)
         publish(
             settings = settings,
             mode = MODE_IDLE,
@@ -297,6 +326,7 @@ class SolarMpptController(
         const val MODE_HOLD = "Hold"
         const val MODE_ALARM = "Alarm"
         const val MODE_VOLTAGE = "Voltage"
+        const val MODE_UNATTENDED = "Unattended"
 
         private const val OFFSET_ALPHA = 0.15
         private const val CV_WRITE_EPS_V = 0.05

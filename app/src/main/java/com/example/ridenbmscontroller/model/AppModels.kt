@@ -44,6 +44,8 @@ data class MpptState(
     val chargeStage: EpeverChargeStage = EpeverChargeStage.NoCharging,
     val fault: Boolean = false,
     val generatedWhToday: Double = 0.0,
+    val generatedWhMonth: Double = 0.0,
+    val generatedWhYear: Double = 0.0,
     val generatedWhTotal: Double = 0.0,
     val voltageOffset: Double = 0.0,
     val commandCvVolts: Double = 0.0
@@ -68,7 +70,9 @@ data class ControllerState(
     val commandCvVolts: Double = 0.0,
     val voltageOffset: Double = 0.0,
     val chargingOn: Boolean = false,
-    val averagePackCurrentA: Double? = null
+    val averagePackCurrentA: Double? = null,
+    val profileBoostVolts: Double = 14.20,
+    val profileFloatVolts: Double = 13.60
 )
 
 data class AlertState(
@@ -99,7 +103,8 @@ data class AppSettings(
     val keepScreenOn: Boolean,
     val logEventsEnabled: Boolean = true,
     val logTelemetryEnabled: Boolean = true,
-    val logHistoryEnabled: Boolean = true
+    val logHistoryEnabled: Boolean = true,
+    val unattendedMode: Boolean = false
 )
 
 data class HistoryPoint(
@@ -183,7 +188,7 @@ data class AppState(
                 bmsOfflineMaxBatteryVolts = 14.20,
                 balanceEveryDays = 7,
                 lastBalanceEpochDay = 0L,
-                controllerEnabled = false,
+                controllerEnabled = true,
                 normalSocCeilingPercent = 95,
                 normalSocResumePercent = 93,
                 bmsCurrentDeadbandAmps = 1.0,

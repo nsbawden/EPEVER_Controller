@@ -129,7 +129,15 @@ class EpeverUsbMonitor(
                     )
                     var sampleSeq = 0L
                     while (isActive) {
-                        val telemetry = ioMutex.withLock { readTelemetry(io) }
+                        val (telemetry, clock) = ioMutex.withLock {
+                            val nextTelemetry = readTelemetry(io)
+                            val nextClock = if (sampleSeq % 5L == 0L) {
+                                runCatching { readClock(io) }.getOrNull()
+                            } else {
+                                null
+                            }
+                            nextTelemetry to nextClock
+                        }
                         sampleSeq += 1L
                         publishOnMain(
                             state.copy(
@@ -137,7 +145,8 @@ class EpeverUsbMonitor(
                                 permissionNeeded = false,
                                 status = "EPEVER live",
                                 telemetry = telemetry,
-                                telemetrySampleSeq = sampleSeq
+                                telemetrySampleSeq = sampleSeq,
+                                clock = clock ?: state.clock
                             )
                         )
                         delay(POLL_MS)
@@ -165,6 +174,111 @@ class EpeverUsbMonitor(
                 ioMutex.withLock { io.writeSingleCoil(SLAVE_ID, COIL_CHARGING, enabled) }
             }.onFailure {
                 publishOnMain(state.copy(status = "Charge coil failed: ${it.message ?: it.javaClass.simpleName}"))
+            }
+        }
+    }
+
+    fun readBatteryProfile(onResult: (Result<EpeverBatteryProfile>) -> Unit) {
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onResult(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock { readBatteryProfile(io) }
+            }
+            withContext(Dispatchers.Main) { onResult(result) }
+        }
+    }
+
+    fun writeBatteryProfile(profile: EpeverBatteryProfile, onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onResult(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock { writeBatteryProfile(io, profile) }
+            }
+            withContext(Dispatchers.Main) { onResult(result) }
+        }
+    }
+
+    fun writeProtectionParams(profile: EpeverBatteryProfile, onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onResult(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock { writeProtectionParams(io, profile) }
+            }
+            withContext(Dispatchers.Main) { onResult(result) }
+        }
+    }
+
+    fun clearGeneratedEnergy(onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onResult(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock {
+                    io.writeSingleCoil(SLAVE_ID, COIL_CLEAR_GENERATED_ENERGY, true)
+                    delay(250)
+                    readTelemetry(io)
+                }
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { telemetry ->
+                    publish(
+                        state.copy(
+                            telemetry = telemetry.copy(
+                                generatedWhToday = 0.0,
+                                generatedWhMonth = 0.0,
+                                generatedWhYear = 0.0,
+                                generatedWhTotal = 0.0
+                            )
+                        )
+                    )
+                }
+                onResult(result.map { })
+            }
+        }
+    }
+
+    fun writeClockFromPhone(onResult: (Result<EpeverClock>) -> Unit = {}) {
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onResult(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val clock = EpeverClock.fromPhoneNow()
+            val result = runCatching {
+                ioMutex.withLock { io.writeHoldingRegs(SLAVE_ID, REG_RTC, clock.toRegisters()) }
+                clock
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { written ->
+                    publish(state.copy(clock = written, status = "EPEVER clock set"))
+                }
+                onResult(result)
             }
         }
     }
@@ -200,6 +314,58 @@ class EpeverUsbMonitor(
         }
     }
 
+    private suspend fun readBatteryProfile(io: ModbusIo): EpeverBatteryProfile {
+        val regs = io.readHoldingRegs(SLAVE_ID, REG_BATTERY_TYPE, 15)
+        return EpeverBatteryProfile(
+            batteryType = regs[0] and 0xFFFF,
+            capacityAh = regs[1] and 0xFFFF,
+            tempCompensationMvv = fromRegTempComp(regs[2]),
+            highVoltageDisconnect = fromRegV(regs[3]),
+            chargingLimitVolts = fromRegV(regs[4]),
+            overVoltageReconnect = fromRegV(regs[5]),
+            equalizeVolts = fromRegV(regs[6]),
+            boostVolts = fromRegV(regs[7]),
+            floatVolts = fromRegV(regs[8]),
+            boostReconnectVolts = fromRegV(regs[9]),
+            lowVoltageReconnect = fromRegV(regs[10]),
+            underVoltageRecover = fromRegV(regs[11]),
+            underVoltageWarning = fromRegV(regs[12]),
+            lowVoltageDisconnect = fromRegV(regs[13]),
+            dischargingLimitVolts = fromRegV(regs[14])
+        )
+    }
+
+    private suspend fun writeBatteryProfile(io: ModbusIo, profile: EpeverBatteryProfile) {
+        io.writeHoldingRegs(SLAVE_ID, REG_BATTERY_TYPE, profile.toRegisterBlock())
+    }
+
+    private suspend fun writeProtectionParams(io: ModbusIo, profile: EpeverBatteryProfile) {
+        io.writeHoldingRegs(
+            SLAVE_ID,
+            REG_BATTERY_TYPE,
+            intArrayOf(
+                profile.batteryType.coerceIn(0, 5),
+                profile.capacityAh.coerceIn(1, 3000),
+                toRegTempComp(profile.tempCompensationMvv)
+            )
+        )
+        io.writeHoldingRegs(
+            SLAVE_ID,
+            REG_LVR,
+            intArrayOf(
+                toRegV(profile.lowVoltageReconnect),
+                toRegV(profile.underVoltageRecover),
+                toRegV(profile.underVoltageWarning),
+                toRegV(profile.lowVoltageDisconnect),
+                toRegV(profile.dischargingLimitVolts)
+            )
+        )
+    }
+
+    private suspend fun readClock(io: ModbusIo): EpeverClock {
+        return EpeverClock.fromRegisters(io.readHoldingRegs(SLAVE_ID, REG_RTC, 3))
+    }
+
     private suspend fun readTelemetry(io: ModbusIo): EpeverTelemetry {
         val rt = io.readInputRegs(SLAVE_ID, REG_REALTIME, 18)
         val status = io.readInputRegs(SLAVE_ID, REG_CHARGING_STATUS, 1)
@@ -228,7 +394,9 @@ class EpeverUsbMonitor(
             running = (chargingStatus and 0x01) != 0,
             fault = (chargingStatus and 0x02) != 0,
             generatedWhToday = fromEnergyWh(stats[12], stats[13]),
-            generatedWhTotal = fromEnergyKwh(stats[18], stats[19]) * 1000.0,
+            generatedWhMonth = fromEnergyWh(stats[14], stats[15]),
+            generatedWhYear = fromEnergyWh(stats[16], stats[17]),
+            generatedWhTotal = fromEnergyWh(stats[18], stats[19]),
             maxPvVoltsToday = fromRegV(stats[0]),
             minPvVoltsToday = fromRegV(stats[1]),
             maxBatteryVoltsToday = fromRegV(stats[2]),
@@ -306,13 +474,39 @@ class EpeverUsbMonitor(
         private const val SLAVE_ID = 1
         private const val POLL_MS = 400L
         private const val COIL_CHARGING = 0x0000
+        private const val COIL_CLEAR_GENERATED_ENERGY = 0x0014
         private const val REG_REALTIME = 0x3100
         private const val REG_CHARGING_STATUS = 0x3201
         private const val REG_STATS = 0x3300
+        private const val REG_BATTERY_TYPE = 0x9000
         private const val REG_HVD = 0x9003
+        private const val REG_LVR = 0x900A
+        private const val REG_RTC = 0x9013
 
         private fun toRegV(volts: Double): Int = (volts * 100.0).toInt().coerceIn(0, 1500)
         private fun fromRegV(raw: Int): Double = (raw and 0xFFFF) / 100.0
+        private fun toRegTempComp(value: Double): Int = (value * 100.0).toInt().coerceIn(0, 900)
+        private fun fromRegTempComp(raw: Int): Double = raw.toShort().toInt() / 100.0
+
+        private fun EpeverBatteryProfile.toRegisterBlock(): IntArray {
+            return intArrayOf(
+                batteryType.coerceIn(0, 5),
+                capacityAh.coerceIn(1, 3000),
+                toRegTempComp(tempCompensationMvv),
+                toRegV(highVoltageDisconnect),
+                toRegV(chargingLimitVolts),
+                toRegV(overVoltageReconnect),
+                toRegV(equalizeVolts),
+                toRegV(boostVolts),
+                toRegV(floatVolts),
+                toRegV(boostReconnectVolts),
+                toRegV(lowVoltageReconnect),
+                toRegV(underVoltageRecover),
+                toRegV(underVoltageWarning),
+                toRegV(lowVoltageDisconnect),
+                toRegV(dischargingLimitVolts)
+            )
+        }
         private fun fromRegA(raw: Int): Double = (raw and 0xFFFF) / 100.0
         private fun fromDwordW(low: Int, high: Int): Double {
             val value = ((high and 0xFFFF) shl 16) or (low and 0xFFFF)
@@ -321,10 +515,6 @@ class EpeverUsbMonitor(
         private fun fromEnergyWh(low: Int, high: Int): Double {
             val value = ((high and 0xFFFF) shl 16) or (low and 0xFFFF)
             return value * 10.0
-        }
-        private fun fromEnergyKwh(low: Int, high: Int): Double {
-            val value = ((high and 0xFFFF) shl 16) or (low and 0xFFFF)
-            return value / 100.0
         }
         private fun fromRegTempC(raw: Int): Double {
             val signed = raw.toShort().toInt()

@@ -35,25 +35,31 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.ridenbmscontroller.logging.OpsLogger
+import com.example.ridenbmscontroller.logging.OpsLogStorageSummary
 import com.example.ridenbmscontroller.model.AppSettings
-import com.example.ridenbmscontroller.model.EnergyCounters
 import com.example.ridenbmscontroller.model.MpptState
 import com.example.ridenbmscontroller.ui.theme.Panel
 import com.example.ridenbmscontroller.ui.theme.TextMuted
+import com.example.ridenbmscontroller.ui.theme.WarningOrange
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 @Composable
 fun SettingsScreen(
     settings: AppSettings,
     mppt: MpptState,
-    energy: EnergyCounters,
     socDriftAh: Double = 0.0,
     worstCaseSocPercent: Int? = null,
     onSettingsChanged: (AppSettings) -> Unit,
     balanceDayToday: Boolean,
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
-    onResetEnergyTotal: () -> Unit,
     onResetSocDrift: () -> Unit = {},
+    opsLogSummary: OpsLogStorageSummary = OpsLogStorageSummary(0L, emptyList(), ""),
+    onDeleteOpsLogsBeforeDate: (String) -> String = { "Unavailable" },
+    onRefreshOpsLogSummary: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -155,13 +161,41 @@ fun SettingsScreen(
             ToggleRow("Controller history log", settings.logHistoryEnabled) {
                 onSettingsChanged(settings.copy(logHistoryEnabled = it))
             }
-        }
-        SettingsGroup("Energy counters") {
-            SettingRow("Today", energy.whToday.formatWattHoursLong())
-            SettingRow("Yesterday", energy.whYesterday.formatWattHoursLong())
-            SettingRow("Total", energy.whTotal.formatWattHoursLong())
-            Button(onClick = onResetEnergyTotal, modifier = Modifier.fillMaxWidth()) {
-                Text("Reset Total Wh")
+            SettingRow("Storage", "${OpsLogger.formatSize(opsLogSummary.totalBytes)} / ${opsLogSummary.days.size} days")
+            if (opsLogSummary.logDirectory.isNotBlank()) {
+                Text(opsLogSummary.logDirectory, color = TextMuted, fontSize = 12.sp)
+            }
+            opsLogSummary.days.take(8).forEach { day ->
+                Text(
+                    "${day.dateLabel}  tel ${OpsLogger.formatSize(day.telemetryBytes)}  ev ${OpsLogger.formatSize(day.eventsBytes)}",
+                    color = TextMuted
+                )
+            }
+            Button(onClick = onRefreshOpsLogSummary, modifier = Modifier.fillMaxWidth()) {
+                Text("Refresh Log Summary")
+            }
+            var deleteDate by remember {
+                mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.US).format(System.currentTimeMillis()))
+            }
+            var deleteMessage by remember { mutableStateOf("") }
+            OutlinedTextField(
+                value = deleteDate,
+                onValueChange = { deleteDate = it },
+                label = { Text("Delete logs before (YYYY-MM-DD)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(
+                onClick = {
+                    deleteMessage = onDeleteOpsLogsBeforeDate(deleteDate.trim())
+                    onRefreshOpsLogSummary()
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Delete Older Logs")
+            }
+            if (deleteMessage.isNotBlank()) {
+                Text(deleteMessage, color = if (opsLogSummary.totalBytes >= OpsLogger.STORAGE_WARN_BYTES) WarningOrange else TextMuted)
             }
         }
     }
@@ -368,11 +402,3 @@ private fun Double.formatSetting(): String {
     }
 }
 
-private fun Double.formatWattHoursLong(): String {
-    val absValue = kotlin.math.abs(this)
-    return when {
-        absValue >= 1_000_000.0 -> "%.2f MWH".format(this / 1_000_000.0)
-        absValue >= 10_000.0 -> "%.1f kWH".format(this / 1_000.0)
-        else -> "%.1f WH".format(this)
-    }
-}

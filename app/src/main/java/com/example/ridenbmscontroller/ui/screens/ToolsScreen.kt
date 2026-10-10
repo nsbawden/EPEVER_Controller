@@ -2,321 +2,392 @@ package com.example.ridenbmscontroller.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.ridenbmscontroller.logging.OpsLogger
-import com.example.ridenbmscontroller.model.AppState
+import com.example.ridenbmscontroller.epever.EpeverBatteryProfile
+import com.example.ridenbmscontroller.epever.EpeverClock
+import com.example.ridenbmscontroller.model.MpptState
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
-import com.example.ridenbmscontroller.ui.theme.CurrentRose
 import com.example.ridenbmscontroller.ui.theme.Panel
-import com.example.ridenbmscontroller.ui.theme.PanelAlt
-import com.example.ridenbmscontroller.ui.theme.PowerBlue
 import com.example.ridenbmscontroller.ui.theme.TextMuted
-import com.example.ridenbmscontroller.ui.theme.VoltageAmber
 import com.example.ridenbmscontroller.ui.theme.WarningOrange
-import java.text.SimpleDateFormat
-import java.util.Locale
-import kotlin.math.abs
-
-private val toolTabs = listOf("Events", "SOC Hold", "Logs", "Telemetry")
+import kotlinx.coroutines.delay
 
 @Composable
 fun ToolsScreen(
-    state: AppState,
+    unattendedMode: Boolean,
+    profile: EpeverBatteryProfile,
+    epeverConnected: Boolean,
+    epeverClock: EpeverClock?,
+    mppt: MpptState,
+    status: String,
     modifier: Modifier = Modifier,
-    onDeleteOpsLogsBeforeDate: (String) -> String = { "Unavailable" },
-    onRefreshOpsLogSummary: () -> Unit = {}
+    onRefreshFromEpever: () -> Unit,
+    onUnattendedModeChanged: (Boolean) -> Unit,
+    onProfileChanged: (EpeverBatteryProfile, writeToEpever: Boolean) -> Unit,
+    onSyncClockFromPhone: () -> Unit,
+    onClearGeneratedEnergy: () -> Unit
 ) {
-    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var phoneClock by remember { mutableStateOf(EpeverClock.fromPhoneNow()) }
+    LaunchedEffect(Unit) {
+        onRefreshFromEpever()
+        while (true) {
+            phoneClock = EpeverClock.fromPhoneNow()
+            delay(1_000)
+        }
+    }
 
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .verticalScroll(rememberScrollState())
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Tools", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+        Text("EPEVER profile", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
         Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-            TabRow(selectedTabIndex = selectedTab) {
-                toolTabs.forEachIndexed { index, title ->
-                    Tab(
-                        selected = selectedTab == index,
-                        onClick = { selectedTab = index },
-                        text = { Text(title) }
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column {
+                        Text("Mode", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (unattendedMode) "Unattended" else "Live",
+                            color = if (unattendedMode) WarningOrange else BatteryGreen,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Switch(
+                        checked = unattendedMode,
+                        onCheckedChange = onUnattendedModeChanged
                     )
+                }
+                Text(
+                    if (unattendedMode) {
+                        "Phone is monitor-only. EPEVER is using the battery profile below."
+                    } else {
+                        "Phone is controlling charge. Overlay voltages show the intended unattended set, not the live CV."
+                    },
+                    color = TextMuted,
+                    fontSize = 13.sp
+                )
+                Text(
+                    if (epeverConnected) status else "EPEVER disconnected",
+                    color = TextMuted,
+                    fontSize = 13.sp
+                )
+                Button(onClick = onRefreshFromEpever, modifier = Modifier.fillMaxWidth(), enabled = epeverConnected) {
+                    Text("Read EPEVER now")
                 }
             }
         }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            when (selectedTab) {
-                0 -> EventsTool(state)
-                1 -> TuningTool(state)
-                2 -> OpsLogsTool(state, onDeleteOpsLogsBeforeDate, onRefreshOpsLogSummary)
-                else -> TelemetryTool(state)
+
+        ProfileGroup("Controller clock") {
+            ClockRow("EPEVER", epeverClock?.takeIf { it.valid }?.format() ?: if (epeverConnected) "Reading…" else "Disconnected")
+            ClockRow("Phone", phoneClock.format())
+            Text(
+                "Daily / monthly / yearly watt-hours reset at EPEVER midnight.",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            Button(
+                onClick = onSyncClockFromPhone,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = epeverConnected
+            ) {
+                Text("Sync from phone")
+            }
+        }
+
+        ProfileGroup("Generated energy") {
+            ClockRow("Today", mppt.generatedWhToday.formatWattHoursLong())
+            ClockRow("This month", mppt.generatedWhMonth.formatWattHoursLong())
+            ClockRow("This year", mppt.generatedWhYear.formatWattHoursLong())
+            ClockRow("Total", mppt.generatedWhTotal.formatWattHoursLong())
+            Text(
+                if (epeverConnected) status else "EPEVER disconnected",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            Text(
+                "Reset clears today, month, year, and lifetime on the EPEVER.",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            Button(
+                onClick = onClearGeneratedEnergy,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = epeverConnected
+            ) {
+                Text("Reset generated energy")
+            }
+        }
+
+        ProfileGroup("Battery") {
+            TypeRow(profile.batteryType) { type ->
+                onProfileChanged(profile.copy(batteryType = type), true)
+            }
+            IntField("Capacity", profile.capacityAh, "Ah", 1, 3000) {
+                onProfileChanged(profile.copy(capacityAh = it), true)
+            }
+            NumberField("Temp compensation", profile.tempCompensationMvv, "mV/°C/2V", 0.0, 9.0) {
+                onProfileChanged(profile.copy(tempCompensationMvv = it), true)
+            }
+        }
+
+        ProfileGroup(if (unattendedMode) "Charge voltages" else "Unattended charge voltages") {
+            NumberField("High voltage disconnect", profile.highVoltageDisconnect, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(highVoltageDisconnect = it), unattendedMode)
+            }
+            NumberField("Charging limit", profile.chargingLimitVolts, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(chargingLimitVolts = it), unattendedMode)
+            }
+            NumberField("Over voltage reconnect", profile.overVoltageReconnect, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(overVoltageReconnect = it), unattendedMode)
+            }
+            NumberField("Equalize", profile.equalizeVolts, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(equalizeVolts = it), unattendedMode)
+            }
+            NumberField("Boost", profile.boostVolts, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(boostVolts = it), unattendedMode)
+            }
+            NumberField("Float", profile.floatVolts, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(floatVolts = it), unattendedMode)
+            }
+            NumberField("Boost reconnect", profile.boostReconnectVolts, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(boostReconnectVolts = it), unattendedMode)
+            }
+        }
+
+        ProfileGroup("Low-voltage protection") {
+            NumberField("Low voltage reconnect", profile.lowVoltageReconnect, "V", 10.0, 14.0) {
+                onProfileChanged(profile.copy(lowVoltageReconnect = it), true)
+            }
+            NumberField("Under voltage recover", profile.underVoltageRecover, "V", 10.0, 14.0) {
+                onProfileChanged(profile.copy(underVoltageRecover = it), true)
+            }
+            NumberField("Under voltage warning", profile.underVoltageWarning, "V", 10.0, 14.0) {
+                onProfileChanged(profile.copy(underVoltageWarning = it), true)
+            }
+            NumberField("Low voltage disconnect", profile.lowVoltageDisconnect, "V", 10.0, 14.0) {
+                onProfileChanged(profile.copy(lowVoltageDisconnect = it), true)
+            }
+            NumberField("Discharging limit", profile.dischargingLimitVolts, "V", 10.0, 14.0) {
+                onProfileChanged(profile.copy(dischargingLimitVolts = it), true)
             }
         }
     }
 }
 
 @Composable
-private fun EventsTool(state: AppState) {
-    ToolCard("Controller Events") {
-        Text(
-            "Recent mode changes and alerts. Full timeline is in daily ops_logs/*_events.csv.",
-            color = TextMuted,
-            fontSize = 13.sp
-        )
-        if (state.events.isEmpty()) {
-            Text("No controller events yet.", color = TextMuted)
-        } else {
-            Column(Modifier.horizontalScroll(rememberScrollState())) {
-                state.events.forEach {
-                    Text(
-                        text = it,
-                        color = TextMuted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        softWrap = false
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TuningTool(state: AppState) {
-    val target = state.settings.bmsVoltageHoldVolts
-    val actual = state.battery.volts
-    val error = actual - target
-    val targetReached = state.battery.socPercent >= state.controller.socTargetPercent
-    val guidance = when {
-        !state.controller.enabled -> "Controller is off."
-        !state.controller.epeverConnected -> "Waiting for EPEVER USB telemetry."
-        !state.controller.bmsConnected -> "BMS offline: MPPT uses its own voltage setpoints."
-        state.controller.pvMode == "Alarm" -> "Charging is inhibited by BMS alarm handling."
-        targetReached && abs(error) <= 0.03 -> "Hold is on target. BMS voltage is within 0.03 V of ${"%.2f".format(target)} V."
-        targetReached && error > 0.03 -> "BMS is above hold. The app should lower EPEVER CV using the MPPT-minus-BMS offset."
-        targetReached && error < -0.03 -> "BMS is below hold. The app should raise EPEVER CV, or solar may be short of load."
-        else -> "SOC target has not been reached; EPEVER is in native bulk."
-    }
-
-    ToolCard("BMS Voltage Hold") {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            MiniTile(
-                label = "BMS V",
-                value = "%.2f".format(actual),
-                unit = "V",
-                color = CurrentRose,
-                modifier = Modifier.weight(1f)
-            )
-            MiniTile("Hold Target", "%.2f".format(target), "V", BatteryGreen, Modifier.weight(1f))
-            MiniTile(
-                label = "Error",
-                value = "%+.2f".format(error),
-                unit = "V",
-                color = if (abs(error) <= 0.03) BatteryGreen else WarningOrange,
-                modifier = Modifier.weight(1f)
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            MiniTile(
-                label = "SOC Target",
-                value = state.controller.socTargetPercent.toString(),
-                unit = "%",
-                color = if (state.controller.socTargetPercent >= 100) WarningOrange else BatteryGreen,
-                modifier = Modifier.weight(1f)
-            )
-            MiniTile("Command CV", "%.2f".format(state.controller.commandCvVolts), "V", VoltageAmber, Modifier.weight(1f))
-            MiniTile("Offset", "%+.2f".format(state.controller.voltageOffset), "V", VoltageAmber, Modifier.weight(1f))
-        }
-        MiniTile("Mode", state.controller.pvMode, "", modeColor(state.controller.pvMode), Modifier.fillMaxWidth())
-        Text(guidance, color = TextMuted, fontSize = 13.sp)
-        Text(state.controller.status, color = TextMuted, fontSize = 13.sp)
-    }
-}
-
-@Composable
-private fun OpsLogsTool(
-    state: AppState,
-    onDeleteOpsLogsBeforeDate: (String) -> String,
-    onRefreshOpsLogSummary: () -> Unit
-) {
-    var deleteDate by rememberSaveable {
-        mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.US).format(System.currentTimeMillis()))
-    }
-    var actionMessage by rememberSaveable { mutableStateOf("") }
-    val summary = state.opsLogSummary
-
-    ToolCard("Operational Logging") {
-        Text(
-            "Telemetry is written more often during Hold and Alarm, then slows down in Bulk. " +
-                "Events are timestamped on every policy and charge-coil change.",
-            color = TextMuted,
-            fontSize = 13.sp
-        )
-        MiniTile(
-            "Live",
-            state.controller.pvMode,
-            "CV ${"%.2f".format(state.controller.commandCvVolts)}V | Offset ${"%+.2f".format(state.controller.voltageOffset)}V",
-            modeColor(state.controller.pvMode),
-            Modifier.fillMaxWidth()
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            MiniTile(
-                "Charge",
-                if (state.controller.chargingOn) "ON" else "OFF",
-                "SOC ${state.controller.socTargetPercent}%",
-                if (state.controller.chargingOn) BatteryGreen else TextMuted,
-                Modifier.weight(1f)
-            )
-            MiniTile(
-                "Total Logs",
-                OpsLogger.formatSize(summary.totalBytes),
-                "${summary.days.size} days",
-                if (summary.totalBytes >= OpsLogger.STORAGE_WARN_BYTES) WarningOrange else PowerBlue,
-                Modifier.weight(1f)
-            )
-        }
-        if (summary.logDirectory.isNotBlank()) {
-            Text("Path: ${summary.logDirectory}", color = TextMuted, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
-        }
-        Button(onClick = { onRefreshOpsLogSummary() }, modifier = Modifier.fillMaxWidth()) {
-            Text("Refresh Log Summary")
-        }
-    }
-
-    ToolCard("Daily Log Files") {
-        if (summary.days.isEmpty()) {
-            Text("No log files yet.", color = TextMuted)
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                summary.days.forEach { day ->
-                    Text(
-                        text = "${day.dateLabel}  telemetry ${OpsLogger.formatSize(day.telemetryBytes)}  " +
-                            "events ${OpsLogger.formatSize(day.eventsBytes)}  " +
-                            "total ${OpsLogger.formatSize(day.totalBytes)}",
-                        color = TextMuted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp
-                    )
-                }
-            }
-        }
-    }
-
-    ToolCard("Delete Old Logs") {
-        Text(
-            "Remove all daily log files strictly before the date below. Today's logs are kept.",
-            color = TextMuted,
-            fontSize = 13.sp
-        )
-        OutlinedTextField(
-            value = deleteDate,
-            onValueChange = { deleteDate = it },
-            label = { Text("Delete logs before (YYYY-MM-DD)") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-        Button(
-            onClick = {
-                actionMessage = onDeleteOpsLogsBeforeDate(deleteDate.trim())
-                onRefreshOpsLogSummary()
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Delete Older Logs")
-        }
-        if (actionMessage.isNotBlank()) {
-            Text(actionMessage, color = TextMuted, fontSize = 13.sp)
-        }
-    }
-}
-
-@Composable
-private fun TelemetryTool(state: AppState) {
-    ToolCard("Live Telemetry") {
-        state.logs.forEach {
-            Text(it, color = TextMuted, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-        }
-    }
-}
-
-@Composable
-private fun ToolCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+private fun ProfileGroup(title: String, content: @Composable ColumnScope.() -> Unit) {
     Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(title, fontWeight = FontWeight.SemiBold)
             content()
         }
     }
 }
 
+private fun Double.formatWattHoursLong(): String {
+    val absValue = kotlin.math.abs(this)
+    return when {
+        absValue >= 1_000_000.0 -> "%.2f MWH".format(this / 1_000_000.0)
+        absValue >= 10_000.0 -> "%.1f kWH".format(this / 1_000.0)
+        else -> "%.1f WH".format(this)
+    }
+}
+
 @Composable
-private fun MiniTile(
-    label: String,
-    value: String,
-    unit: String,
-    color: Color,
-    modifier: Modifier = Modifier
-) {
-    Surface(color = PanelAlt, shape = RoundedCornerShape(8.dp), modifier = modifier) {
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(6.dp)) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(label, color = TextMuted, fontSize = 10.sp, textAlign = TextAlign.Center, maxLines = 1)
-                Text(value, color = color, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-                Text(unit, color = TextMuted, fontSize = 9.sp)
-            }
+private fun ClockRow(label: String, value: String) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(label, color = TextMuted)
+        Text(value, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun TypeRow(type: Int, onTypeChange: (Int) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text("Battery type", color = TextMuted)
+        Button(onClick = { onTypeChange((type + 1) % 6) }) {
+            Text(EpeverBatteryProfile.batteryTypeLabel(type))
         }
     }
 }
 
-private fun modeColor(mode: String): Color {
-    return when (mode) {
-        "Hold" -> BatteryGreen
-        "Bulk" -> PowerBlue
-        "Alarm" -> WarningOrange
-        "Voltage" -> VoltageAmber
-        else -> TextMuted
+@Composable
+private fun NumberField(
+    label: String,
+    value: Double,
+    unit: String,
+    min: Double,
+    max: Double,
+    onValueChange: (Double) -> Unit
+) {
+    var text by remember(label) { mutableStateOf("%.2f".format(value)) }
+    var focused by remember(label) { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+    val latestText by rememberUpdatedState(text)
+    val latestValue by rememberUpdatedState(value)
+    val latestOnValueChange by rememberUpdatedState(onValueChange)
+
+    fun commit(current: String, fallback: Double) {
+        val committed = current.toDoubleOrNull()?.coerceIn(min, max) ?: fallback
+        text = "%.2f".format(committed)
+        if (kotlin.math.abs(committed - latestValue) > 0.000_5) {
+            latestOnValueChange(committed)
+        }
+    }
+
+    LaunchedEffect(value, focused) {
+        if (!focused) text = "%.2f".format(value)
+    }
+    DisposableEffect(label) {
+        onDispose {
+            val committed = latestText.toDoubleOrNull()?.coerceIn(min, max) ?: latestValue
+            if (kotlin.math.abs(committed - latestValue) > 0.000_5) {
+                latestOnValueChange(committed)
+            }
+        }
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(label, color = TextMuted, modifier = Modifier.weight(1f))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1.15f)
+        ) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = {
+                    commit(text, value)
+                    focusManager.clearFocus()
+                }),
+                modifier = Modifier
+                    .weight(1f)
+                    .onFocusChanged {
+                        focused = it.isFocused
+                        if (!it.isFocused) commit(text, value)
+                    }
+            )
+            Text(unit, color = TextMuted)
+        }
+    }
+}
+
+@Composable
+private fun IntField(
+    label: String,
+    value: Int,
+    unit: String,
+    min: Int,
+    max: Int,
+    onValueChange: (Int) -> Unit
+) {
+    var text by remember(label) { mutableStateOf(value.toString()) }
+    var focused by remember(label) { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+    val latestText by rememberUpdatedState(text)
+    val latestValue by rememberUpdatedState(value)
+    val latestOnValueChange by rememberUpdatedState(onValueChange)
+
+    fun commit(current: String, fallback: Int) {
+        val committed = current.toIntOrNull()?.coerceIn(min, max) ?: fallback
+        text = committed.toString()
+        if (committed != latestValue) latestOnValueChange(committed)
+    }
+
+    LaunchedEffect(value, focused) {
+        if (!focused) text = value.toString()
+    }
+    DisposableEffect(label) {
+        onDispose {
+            val committed = latestText.toIntOrNull()?.coerceIn(min, max) ?: latestValue
+            if (committed != latestValue) latestOnValueChange(committed)
+        }
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(label, color = TextMuted, modifier = Modifier.weight(1f))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1.15f)
+        ) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = {
+                    commit(text, value)
+                    focusManager.clearFocus()
+                }),
+                modifier = Modifier
+                    .weight(1f)
+                    .onFocusChanged {
+                        focused = it.isFocused
+                        if (!it.isFocused) commit(text, value)
+                    }
+            )
+            Text(unit, color = TextMuted)
+        }
     }
 }

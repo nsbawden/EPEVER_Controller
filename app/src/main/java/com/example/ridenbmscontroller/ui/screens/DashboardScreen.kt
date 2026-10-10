@@ -52,6 +52,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.ridenbmscontroller.epever.EpeverChargeStage
 import com.example.ridenbmscontroller.model.AppState
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
 import com.example.ridenbmscontroller.ui.theme.CurrentRose
@@ -86,8 +87,6 @@ fun DashboardScreen(
     ) {
         BatteryGaugeCard(state, onSilenceLowSocAlarm, onSilenceSocDriftAlarm)
         MpptPanel(state, onPressureTileClick, onToggleBalanceToday)
-        HealthPanel(state)
-        ControllerPanel(state)
     }
 }
 
@@ -370,12 +369,18 @@ private fun MpptPanel(
         ) {
             SolarSplitHeader(state)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile("PV Watts", "%.0f".format(state.mppt.pvWatts), "W", PowerBlue, Modifier.weight(1f))
+                ValueTile(
+                    "Policy",
+                    state.controller.pvMode,
+                    "",
+                    modeColor(state.controller.pvMode),
+                    Modifier.weight(1f)
+                )
                 ValueTile(
                     "Stage",
                     state.mppt.chargeStage.label,
                     "",
-                    if (state.mppt.fault) WarningOrange else PowerBlue,
+                    if (state.mppt.fault) WarningOrange else TextMuted,
                     Modifier.weight(1f)
                 )
                 ValueTile(
@@ -390,25 +395,19 @@ private fun MpptPanel(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile("PV V", "%.2f".format(state.mppt.pvVolts), "V", VoltageAmber, Modifier.weight(1f))
                 ValueTile("PV A", "%.2f".format(state.mppt.pvAmps), "A", CurrentRose, Modifier.weight(1f))
-                ValueTile("MPPT V", "%.2f".format(state.mppt.batteryVolts), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile("PV W", "%.0f".format(state.mppt.pvWatts), "W", PowerBlue, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile("Charge A", "%.2f".format(state.mppt.chargeAmps), "A", CurrentRose, Modifier.weight(1f))
-                ValueTile("Charge W", "%.0f".format(state.mppt.chargeWatts), "W", PowerBlue, Modifier.weight(1f))
+                ValueTile("MPPT V", "%.2f".format(state.mppt.batteryVolts), "V", VoltageAmber, Modifier.weight(1f))
+                ValueTile("MPPT A", "%.2f".format(state.mppt.chargeAmps), "A", CurrentRose, Modifier.weight(1f))
+                ValueTile("MPPT W", "%.0f".format(state.mppt.chargeWatts), "W", PowerBlue, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile(
                     "Offset",
                     "%+.2f".format(state.controller.voltageOffset),
                     "V",
                     VoltageAmber,
-                    Modifier.weight(1f)
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile(
-                    "Policy",
-                    state.controller.pvMode,
-                    "",
-                    modeColor(state.controller.pvMode),
                     Modifier.weight(1f)
                 )
                 ValueTile(
@@ -451,13 +450,8 @@ private fun MpptPanel(
                     WarningOrange,
                     Modifier.weight(1f)
                 )
-                ValueTile(
-                    "Charge",
-                    if (state.controller.chargingOn) "ON" else "OFF",
-                    "",
-                    if (state.controller.chargingOn) BatteryGreen else TextMuted,
-                    Modifier.weight(1f)
-                )
+                val limit = harvestLimit(state)
+                ValueTile("Limit", limit.label, "", limit.color, Modifier.weight(1f))
             }
         }
     }
@@ -529,81 +523,6 @@ private fun SolarSplitHeader(state: AppState) {
     }
 }
 
-@Composable
-private fun HealthPanel(state: AppState) {
-    Surface(
-        color = Panel,
-        shape = RoundedCornerShape(8.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text("Health", fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile(
-                    "Max Charge A",
-                    formatHealthAmps(state.dailyHealth.maxChargeAmpsToday),
-                    "A",
-                    PowerBlue,
-                    Modifier.weight(1f)
-                )
-                ValueTile(
-                    "Fault",
-                    if (state.dailyHealth.mpptFault || state.mppt.fault) "Yes" else "No",
-                    "",
-                    if (state.dailyHealth.mpptFault || state.mppt.fault) WarningOrange else TextMuted,
-                    Modifier.weight(1f)
-                )
-                ValueTile(
-                    "Command CV",
-                    "%.2f".format(state.controller.commandCvVolts),
-                    "V",
-                    VoltageAmber,
-                    Modifier.weight(1f)
-                )
-            }
-        }
-    }
-}
-
-private fun formatHealthAmps(amps: Double?): String {
-    return amps?.let { "%.2f".format(it) } ?: "—"
-}
-
-@Composable
-private fun ControllerPanel(state: AppState) {
-    Surface(
-        color = Panel,
-        shape = RoundedCornerShape(8.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text("Controller", fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip(
-                    if (state.controller.enabled) state.controller.pvMode else "Off",
-                    modeColor(state.controller.pvMode),
-                    Modifier.weight(1f)
-                )
-                StatusChip(
-                    if (state.controller.chargingOn) "Charging ON" else "Charging OFF",
-                    if (state.controller.chargingOn) BatteryGreen else TextMuted,
-                    Modifier.weight(1f)
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusChip("CV ${"%.2f".format(state.controller.commandCvVolts)}V", VoltageAmber, Modifier.weight(1f))
-                StatusChip("Offset ${"%+.2f".format(state.controller.voltageOffset)}V", VoltageAmber, Modifier.weight(1f))
-            }
-            Text(state.controller.status, color = TextMuted, fontSize = 13.sp)
-        }
-    }
-}
 
 @Composable
 internal fun ValueTile(
@@ -641,31 +560,6 @@ internal fun ValueTile(
     }
 }
 
-@Composable
-private fun StatusChip(
-    text: String,
-    color: Color,
-    modifier: Modifier = Modifier,
-    tintedBackground: Boolean = true
-) {
-    Surface(
-        color = if (tintedBackground) color.copy(alpha = 0.16f) else PanelAlt,
-        shape = RoundedCornerShape(8.dp),
-        modifier = modifier.height(40.dp)
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = text,
-                color = color,
-                fontSize = text.statusChipFontSize(),
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-    }
-}
 
 private data class CompactEnergy(val value: String, val unit: String)
 
@@ -678,19 +572,41 @@ private fun String.tileValueFontSize() = when {
     else -> 24.sp
 }
 
-private fun String.statusChipFontSize() = when {
-    length >= 15 -> 15.sp
-    length >= 12 -> 16.sp
-    length >= 9 -> 17.sp
-    else -> 18.sp
+private data class HarvestLimit(val label: String, val color: Color)
+
+private fun harvestLimit(state: AppState): HarvestLimit {
+    val pvWatts = state.mppt.pvWatts
+    val pvVolts = state.mppt.pvVolts
+    val mpptVolts = state.mppt.batteryVolts
+    val mode = state.controller.pvMode
+    val charging = when (mode) {
+        "Unattended", "Idle" -> state.mppt.chargingOn
+        else -> state.controller.chargingOn
+    }
+    val commandedCv = when {
+        mode == "Unattended" && state.mppt.chargeStage == EpeverChargeStage.Float ->
+            state.controller.profileFloatVolts
+        mode == "Unattended" -> state.controller.profileBoostVolts
+        state.controller.commandCvVolts > 0.0 -> state.controller.commandCvVolts
+        else -> state.settings.maxBatteryVolts
+    }
+    val noSun = pvWatts < 10.0 && pvVolts < mpptVolts + 1.0
+    return when {
+        noSun -> HarvestLimit("Night", TextMuted)
+        mode == "Alarm" || !charging -> HarvestLimit("Off", DeviceRed)
+        mode == "Hold" -> HarvestLimit("Hold", WarningOrange)
+        commandedCv - mpptVolts <= 0.15 -> HarvestLimit("CV", VoltageAmber)
+        else -> HarvestLimit("Array", BatteryGreen)
+    }
 }
 
 private fun modeColor(mode: String): Color {
     return when (mode) {
         "Hold" -> BatteryGreen
-        "Bulk" -> PowerBlue
+        "Bulk" -> TextMuted
         "Alarm" -> WarningOrange
         "Voltage" -> VoltageAmber
+        "Unattended" -> WarningOrange
         else -> TextMuted
     }
 }
