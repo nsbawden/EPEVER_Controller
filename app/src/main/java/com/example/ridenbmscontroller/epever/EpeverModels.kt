@@ -105,9 +105,12 @@ data class EpeverUsbState(
     val productId: Int? = null,
     val telemetry: EpeverTelemetry = EpeverTelemetry(),
     val telemetrySampleSeq: Long = 0L,
-    val clock: EpeverClock? = null
+    val clock: EpeverClock? = null,
+    val deviceProfile: EpeverBatteryProfile? = null,
+    val lastWriteNote: String? = null
 )
 
+/** 0x9000–0x900E. Custom voltages require type User (0) in this same 15-register write. */
 data class EpeverBatteryProfile(
     val batteryType: Int = 0,
     val capacityAh: Int = 330,
@@ -128,6 +131,9 @@ data class EpeverBatteryProfile(
     val batteryTypeLabel: String
         get() = batteryTypeLabel(batteryType)
 
+    val regulationVolts: Double
+        get() = minOf(chargingLimitVolts, boostVolts, floatVolts, equalizeVolts)
+
     fun mergeKeepingLiveOverlay(device: EpeverBatteryProfile): EpeverBatteryProfile {
         return copy(
             batteryType = device.batteryType,
@@ -138,6 +144,23 @@ data class EpeverBatteryProfile(
             underVoltageWarning = device.underVoltageWarning,
             lowVoltageDisconnect = device.lowVoltageDisconnect,
             dischargingLimitVolts = device.dischargingLimitVolts
+        )
+    }
+
+    /**
+     * Overlay live CVs onto a device-read block. Type 0 (User) belongs in this same
+     * write — do not send User as a separate 0x9000 transaction beforehand.
+     */
+    fun withLiveVoltages(profile: EpeverVoltageProfile): EpeverBatteryProfile {
+        return copy(
+            batteryType = 0,
+            highVoltageDisconnect = profile.highVoltageDisconnect,
+            chargingLimitVolts = profile.chargeLimitVolts,
+            overVoltageReconnect = profile.overVoltageReconnect,
+            equalizeVolts = profile.equalizeVolts,
+            boostVolts = profile.boostVolts,
+            floatVolts = profile.floatVolts,
+            boostReconnectVolts = profile.boostReconnectVolts
         )
     }
 
@@ -153,6 +176,7 @@ data class EpeverBatteryProfile(
     }
 }
 
+/** Live / park voltage overlay. boostReconnect must stay above LVR + 0.02 V. */
 data class EpeverVoltageProfile(
     val chargeLimitVolts: Double,
     val highVoltageDisconnect: Double,
@@ -163,8 +187,9 @@ data class EpeverVoltageProfile(
     val boostReconnectVolts: Double
 ) {
     companion object {
-        fun bulk(maxBatteryVolts: Double): EpeverVoltageProfile {
+        fun bulk(maxBatteryVolts: Double, lowVoltageReconnect: Double = 12.60): EpeverVoltageProfile {
             val cv = maxBatteryVolts.coerceIn(12.0, 15.0)
+            val lvr = lowVoltageReconnect.coerceIn(9.0, 14.0)
             return EpeverVoltageProfile(
                 chargeLimitVolts = cv,
                 highVoltageDisconnect = (cv + 0.30).coerceAtMost(15.0),
@@ -172,12 +197,13 @@ data class EpeverVoltageProfile(
                 equalizeVolts = cv,
                 boostVolts = cv,
                 floatVolts = cv,
-                boostReconnectVolts = (cv - 0.40).coerceAtLeast(12.60)
+                boostReconnectVolts = (cv - 0.40).coerceAtLeast((lvr + 0.02).coerceAtMost(cv - 0.02))
             )
         }
 
-        fun hold(holdCv: Double, maxBatteryVolts: Double): EpeverVoltageProfile {
+        fun hold(holdCv: Double, maxBatteryVolts: Double, lowVoltageReconnect: Double = 12.60): EpeverVoltageProfile {
             val cv = holdCv.coerceIn(12.40, maxBatteryVolts.coerceIn(12.40, 15.0))
+            val lvr = lowVoltageReconnect.coerceIn(9.0, 14.0)
             return EpeverVoltageProfile(
                 chargeLimitVolts = cv,
                 highVoltageDisconnect = (cv + 0.30).coerceAtMost(15.0),
@@ -185,7 +211,7 @@ data class EpeverVoltageProfile(
                 equalizeVolts = cv,
                 boostVolts = cv,
                 floatVolts = cv,
-                boostReconnectVolts = (cv - 0.20).coerceAtLeast(12.40)
+                boostReconnectVolts = (cv - 0.20).coerceAtLeast((lvr + 0.02).coerceAtMost(cv - 0.02))
             )
         }
     }

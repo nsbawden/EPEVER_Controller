@@ -87,12 +87,6 @@ fun SettingsScreen(
             NumberFieldRow("100% hold voltage", settings.fullHoldVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(fullHoldVolts = it))
             }
-            NumberFieldRow("BMS offline max voltage", settings.bmsOfflineMaxBatteryVolts, "V", 12.0, 15.0) {
-                onSettingsChanged(settings.copy(bmsOfflineMaxBatteryVolts = it))
-            }
-            NumberFieldRow("BMS current deadband", settings.bmsCurrentDeadbandAmps, "A", 0.0, 5.0) {
-                onSettingsChanged(settings.copy(bmsCurrentDeadbandAmps = it))
-            }
             IntFieldRow("Low SOC alarm", settings.lowSocAlarmPercent, "%", 0, 100) {
                 onSettingsChanged(settings.copy(lowSocAlarmPercent = it))
             }

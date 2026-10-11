@@ -4,8 +4,9 @@ import com.example.ridenbmscontroller.ble.BmsBleUiState
 import com.example.ridenbmscontroller.epever.EpeverUsbState
 import com.example.ridenbmscontroller.epever.EpeverVoltageProfile
 import com.example.ridenbmscontroller.model.AppSettings
-import java.util.Calendar
+import com.example.ridenbmscontroller.model.localEpochDay
 import kotlin.math.abs
+import kotlin.math.max
 
 data class MpptControlState(
     val enabled: Boolean = false,
@@ -20,13 +21,26 @@ data class MpptControlState(
     val bmsConnected: Boolean = false
 )
 
+/**
+ * Live charge policy. Every voltage change goes through [applyVoltageProfile]
+ * (full 15-register User block — see [com.example.ridenbmscontroller.epever.EpeverUsbMonitor]).
+ *
+ * Do not use [setCharging] as inhibit: Tracer-AN coil 0x0000 is a no-op.
+ * Do not park from this loop (Tools Off only). Offset EMA is display-only; never
+ * add it to commanded CV (that held CV high vs BMS).
+ *
+ * Hold walks from device readback, never below BMS volts, 5 s / 0.10 V in sun.
+ * BMS lost while holding: leave the last CV. BMS gone 10 s and not in Hold:
+ * No BMS (Tools profile once, then monitor). No invented offline-max write.
+ */
 class SolarMpptController(
     private val setCharging: (Boolean) -> Unit,
-    private val applyVoltageProfile: (EpeverVoltageProfile) -> Unit,
+    private val applyVoltageProfile: (EpeverVoltageProfile, onDone: (Boolean) -> Unit) -> Unit,
     private val onBalanceDayStarted: (Long) -> Unit,
     private val onState: (MpptControlState) -> Unit,
     private val onEvent: (String) -> Unit = {},
-    private val onTopOffComplete: (reason: String) -> Unit = {}
+    private val onTopOffComplete: (reason: String) -> Unit = {},
+    private val onNoBms: () -> Unit = {}
 ) {
     private var lastTickMs = 0L
     private var lastWriteMs = 0L
@@ -42,11 +56,16 @@ class SolarMpptController(
     private var alarmBackoffMs = ALARM_BASE_HOLD_MS
     private var lastAlarmStartMs = 0L
     private var wasInHold = false
+    private var holdCv = Double.NaN
+    private var lastHoldWriteMs = 0L
+    private var alarmLatched = false
+    private var bmsMissingSinceMs = 0L
 
     fun tick(
         settings: AppSettings,
         bmsState: BmsBleUiState,
-        epeverState: EpeverUsbState
+        epeverState: EpeverUsbState,
+        outputHeldOff: Boolean = false
     ) {
         val now = System.currentTimeMillis()
         if (now - lastTickMs < settings.controllerLoopMs.toLong()) return
@@ -61,9 +80,28 @@ class SolarMpptController(
         val socPercent = bms.socPercent
         val batteryVolts = bms.packVoltage
 
+        if (outputHeldOff) {
+            resetNoBmsWatch()
+            lastCharging = false
+            publish(
+                settings = settings,
+                mode = MODE_OUTPUT_OFF,
+                status = "Charge output held off from Tools",
+                commandCv = lastWrittenCv.takeUnless { it.isNaN() } ?: 0.0,
+                holdVolts = settings.bmsVoltageHoldVolts,
+                socTarget = if (isBalanceDay(settings)) 100 else settings.normalSocCeilingPercent,
+                chargingOn = false,
+                epeverConnected = epeverState.connected,
+                bmsConnected = bmsReady
+            )
+            return
+        }
+
         if (settings.unattendedMode) {
+            resetNoBmsWatch()
             holdEstSyncedThisVisit = false
             wasInHold = false
+            clearHoldServo()
             lastCharging = null
             publish(
                 settings = settings,
@@ -79,11 +117,29 @@ class SolarMpptController(
             return
         }
 
-        if (!settings.controllerEnabled || !epeverState.connected) {
+        if (!settings.controllerEnabled) {
+            resetNoBmsWatch()
             holdEstSyncedThisVisit = false
             wasInHold = false
+            clearHoldServo()
             idle(settings, epeverState.connected, bmsReady, "Controller off")
             return
+        }
+        if (!epeverState.connected) {
+            resetNoBmsWatch()
+            lastHoldWriteMs = 0L
+            idle(settings, false, bmsReady, "Controller off")
+            return
+        }
+
+        if (bmsReady) {
+            if (lastMode == MODE_NO_BMS) {
+                lastWriteMs = 0L
+                lastWrittenCv = Double.NaN
+            }
+            bmsMissingSinceMs = 0L
+        } else if (bmsMissingSinceMs == 0L) {
+            bmsMissingSinceMs = now
         }
 
         val balanceDay = bmsReady && isBalanceDay(settings)
@@ -95,6 +151,7 @@ class SolarMpptController(
         if (socTarget > lastSocTarget && lastSocTarget > 0) {
             wasInHold = false
             holdEstSyncedThisVisit = false
+            clearHoldServo()
             sawSocBelowTarget = socPercent != null && socPercent < socTarget
         }
         lastSocTarget = socTarget
@@ -102,10 +159,14 @@ class SolarMpptController(
         if (bmsReady) {
             val alarms = bms.chargeBlockingAlarmNames
             if (alarms.isNotEmpty()) {
-                updateAlarmBackoff(now)
+                if (!alarmLatched) {
+                    alarmLatched = true
+                    updateAlarmBackoff(now)
+                }
                 inhibitCharging(settings, socTarget, holdVolts, epeverState, bmsReady, "BMS alarm: ${alarms.joinToString()}")
                 return
             }
+            alarmLatched = false
             if (now - lastAlarmStartMs >= ALARM_RESET_AFTER_MS) {
                 alarmBackoffMs = ALARM_BASE_HOLD_MS
             }
@@ -116,7 +177,8 @@ class SolarMpptController(
             }
         }
 
-        val bulkCeiling = if (bmsReady) settings.maxBatteryVolts else settings.bmsOfflineMaxBatteryVolts
+        val bulkCeiling = settings.maxBatteryVolts
+        val lowVoltageReconnect = epeverState.deviceProfile?.lowVoltageReconnect ?: 12.60
         updateOffset(epever.batteryVolts, batteryVolts)
 
         val soc = socPercent
@@ -126,79 +188,114 @@ class SolarMpptController(
         if (soc != null && soc < socTarget) sawSocBelowTarget = true
 
         val wantHold = if (wasInHold) {
-            bmsReady && !belowResume
+            !belowResume
         } else {
             reachedSoc
         }
 
-        if (wantHold && batteryVolts != null && batteryVolts >= holdVolts + OVERSHOOT_MARGIN_V) {
-            commandCharging(false)
+        if (wantHold && !bmsReady) {
             publish(
                 settings = settings,
                 mode = MODE_HOLD,
-                status = "Hold overshoot: charging off at ${"%.2f".format(batteryVolts)}V",
+                status = "Hold: BMS telemetry lost, leaving last CV",
                 commandCv = lastWrittenCv.takeUnless { it.isNaN() } ?: holdVolts,
                 holdVolts = holdVolts,
                 socTarget = socTarget,
-                chargingOn = false,
+                chargingOn = true,
                 epeverConnected = true,
-                bmsConnected = bmsReady
+                bmsConnected = false
             )
             return
         }
 
-        commandCharging(true)
-
         if (wantHold) {
-            val cv = (holdVolts + filteredOffset()).coerceIn(12.40, bulkCeiling)
-            maybeWriteProfile(EpeverVoltageProfile.hold(cv, bulkCeiling), cv, now)
+            val overshoot = batteryVolts != null && batteryVolts >= holdVolts + OVERSHOOT_MARGIN_V
+            val cv = servoHoldCv(
+                holdVolts = holdVolts,
+                batteryVolts = batteryVolts,
+                mpptVolts = epever.batteryVolts,
+                harvestAmps = max(epever.chargeAmps, (bms.packCurrent ?: 0.0).coerceAtLeast(0.0)),
+                deviceCv = epeverState.deviceProfile?.regulationVolts,
+                bulkCeiling = bulkCeiling,
+                lowVoltageReconnect = lowVoltageReconnect,
+                now = now
+            )
+            commandCharging(true)
             if (!holdEstSyncedThisVisit && reachedSoc) {
                 holdEstSyncedThisVisit = true
-                onEvent("Hold: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, MPPT offset ${"%+.2f".format(filteredOffset())}V")
+                onEvent("Hold: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, CV ${"%.2f".format(cv)}V")
                 if (sawSocBelowTarget) {
                     onTopOffComplete(if (socTarget >= 100) "100% hold" else "SOC $socTarget% hold")
                     sawSocBelowTarget = false
                 }
             }
             wasInHold = true
+            val belowHold = batteryVolts != null && batteryVolts < holdVolts - 0.02
             publish(
                 settings = settings,
-                mode = MODE_HOLD,
-                status = "Holding BMS ${"%.2f".format(holdVolts)}V (CV ${"%.2f".format(cv)}V)",
+                mode = if (belowHold && !overshoot) MODE_TOPUP else MODE_HOLD,
+                status = when {
+                    overshoot -> "Hold overshoot: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, lowering CV"
+                    belowHold -> "Top-up: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V to ${"%.2f".format(holdVolts)}V (CV ${"%.2f".format(cv)}V)"
+                    else -> "Holding BMS ${"%.2f".format(holdVolts)}V (CV ${"%.2f".format(cv)}V)"
+                },
                 commandCv = cv,
                 holdVolts = holdVolts,
                 socTarget = socTarget,
                 chargingOn = true,
                 epeverConnected = true,
-                bmsConnected = bmsReady
+                bmsConnected = true
             )
             return
         }
 
+        if (!bmsReady) {
+            if (now - bmsMissingSinceMs < NO_BMS_GRACE_MS) {
+                publish(
+                    settings = settings,
+                    mode = lastMode,
+                    status = "Waiting for BMS...",
+                    commandCv = lastWrittenCv.takeUnless { it.isNaN() } ?: 0.0,
+                    holdVolts = holdVolts,
+                    socTarget = socTarget,
+                    chargingOn = epever.chargingOn,
+                    epeverConnected = true,
+                    bmsConnected = false
+                )
+                return
+            }
+            enterNoBms(settings, epever.chargingOn, holdVolts, socTarget)
+            return
+        }
+
+        commandCharging(true)
+
         if (wasInHold) {
             onEvent("Hold exit: resume bulk at ${"%.2f".format(bulkCeiling)}V")
+            lastWriteMs = 0L
         }
         wasInHold = false
         holdEstSyncedThisVisit = false
-        maybeWriteProfile(EpeverVoltageProfile.bulk(bulkCeiling), bulkCeiling, now)
-        val mode = if (bmsReady) MODE_BULK else MODE_VOLTAGE
+        clearHoldServo()
+        maybeWriteProfile(
+            EpeverVoltageProfile.bulk(bulkCeiling, lowVoltageReconnect),
+            bulkCeiling,
+            now
+        )
         publish(
             settings = settings,
-            mode = mode,
-            status = if (bmsReady) {
-                "Bulk charge to SOC $socTarget%"
-            } else {
-                "BMS offline: MPPT at ${"%.2f".format(bulkCeiling)}V"
-            },
+            mode = MODE_BULK,
+            status = "Bulk charge to SOC $socTarget%",
             commandCv = bulkCeiling,
             holdVolts = holdVolts,
             socTarget = socTarget,
             chargingOn = true,
             epeverConnected = true,
-            bmsConnected = bmsReady
+            bmsConnected = true
         )
     }
 
+    /** Display tile ΔV only. Do not feed this into hold/bulk CV. */
     private fun updateOffset(mpptVolts: Double, bmsVolts: Double?) {
         if (bmsVolts == null || mpptVolts <= 0.0 || bmsVolts <= 0.0) return
         val sample = mpptVolts - bmsVolts
@@ -212,18 +309,107 @@ class SolarMpptController(
 
     private fun filteredOffset(): Double = if (offsetReady) offsetEma else 0.0
 
+    private fun clearHoldServo() {
+        holdCv = Double.NaN
+        lastHoldWriteMs = 0L
+    }
+
+    /** Never command a Hold CV below the last BMS pack volts. */
+    private fun holdFloorV(batteryVolts: Double?): Double {
+        return if (batteryVolts != null && batteryVolts > 0.0) max(12.40, batteryVolts) else 12.40
+    }
+
+    private fun clampHoldCv(cv: Double, batteryVolts: Double?, hi: Double): Double {
+        return cv.coerceIn(holdFloorV(batteryVolts), hi)
+    }
+
+    /** Step toward [holdVolts] from the device readback, not from an offset-adjusted guess. */
+    private fun servoHoldCv(
+        holdVolts: Double,
+        batteryVolts: Double?,
+        mpptVolts: Double,
+        harvestAmps: Double,
+        deviceCv: Double?,
+        bulkCeiling: Double,
+        lowVoltageReconnect: Double,
+        now: Long
+    ): Double {
+        val hi = bulkCeiling.coerceIn(12.40, 15.0)
+        val target = clampHoldCv(holdVolts, batteryVolts, hi)
+        val first = holdCv.isNaN()
+        val from = when {
+            deviceCv != null && deviceCv > 0.0 -> deviceCv
+            !lastWrittenCv.isNaN() -> lastWrittenCv
+            !holdCv.isNaN() -> holdCv
+            else -> target
+        }
+        val gap = from - target
+        val next = when {
+            abs(gap) < HOLD_WRITE_EPS_V -> target
+            gap > 0.15 -> target
+            gap > 0.0 -> {
+                val step = when {
+                    harvestAmps >= 8.0 -> HOLD_SUN_STEP_V
+                    harvestAmps >= 3.0 -> 0.06
+                    else -> 0.03
+                }
+                max(target, from - step)
+            }
+            else -> minOf(target, from + 0.05)
+        }
+        holdCv = next
+        if (!first && abs(from - target) < HOLD_WRITE_EPS_V) return target
+        if (!first && now - lastHoldWriteMs < HOLD_SERVO_PERIOD_MS) return holdCv
+        writeHoldCv(holdCv, batteryVolts, hi, lowVoltageReconnect, now)
+        onEvent(
+            "Hold CV ${"%.2f".format(holdCv)}V from ${"%.2f".format(from)}V " +
+                "(BMS ${"%.2f".format(batteryVolts ?: 0.0)}V MPPT ${"%.2f".format(mpptVolts)}V " +
+                "${"%.1f".format(harvestAmps)}A)"
+        )
+        return holdCv
+    }
+
+    private fun writeHoldCv(
+        cv: Double,
+        batteryVolts: Double?,
+        bulkCeiling: Double,
+        lowVoltageReconnect: Double,
+        now: Long
+    ) {
+        val clamped = clampHoldCv(cv, batteryVolts, bulkCeiling)
+        holdCv = clamped
+        lastHoldWriteMs = now
+        lastWriteMs = now
+        applyVoltageProfile(EpeverVoltageProfile.hold(clamped, bulkCeiling, lowVoltageReconnect)) { ok ->
+            if (ok) {
+                lastWrittenCv = clamped
+            } else {
+                lastHoldWriteMs = now - HOLD_SERVO_PERIOD_MS + HOLD_RETRY_MS
+                lastWrittenCv = Double.NaN
+                onEvent("EPEVER hold CV ${"%.2f".format(clamped)}V write failed")
+            }
+            if (lastCharging == false) setCharging(false)
+        }
+    }
+
     private fun maybeWriteProfile(profile: EpeverVoltageProfile, cv: Double, now: Long) {
         val changedEnough = lastWrittenCv.isNaN() || abs(cv - lastWrittenCv) >= CV_WRITE_EPS_V
         val cooledDown = now - lastWriteMs >= CV_WRITE_COOLDOWN_MS
         if (!changedEnough || !cooledDown) return
-        applyVoltageProfile(profile)
-        lastWrittenCv = cv
         lastWriteMs = now
-        onEvent("EPEVER CV ${"%.2f".format(cv)}V")
+        applyVoltageProfile(profile) { ok ->
+            if (ok) {
+                lastWrittenCv = cv
+                onEvent("EPEVER CV ${"%.2f".format(cv)}V")
+            } else {
+                lastWriteMs = 0L
+                onEvent("EPEVER CV ${"%.2f".format(cv)}V write failed")
+            }
+        }
     }
 
-    private fun commandCharging(on: Boolean) {
-        if (lastCharging == on) return
+    private fun commandCharging(on: Boolean, force: Boolean = false) {
+        if (!force && lastCharging == on) return
         lastCharging = on
         setCharging(on)
     }
@@ -237,8 +423,7 @@ class SolarMpptController(
         status: String
     ) {
         holdEstSyncedThisVisit = false
-        wasInHold = false
-        commandCharging(false)
+        commandCharging(false, force = true)
         publish(
             settings = settings,
             mode = MODE_ALARM,
@@ -250,6 +435,38 @@ class SolarMpptController(
             epeverConnected = epeverState.connected,
             bmsConnected = bmsReady
         )
+    }
+
+    private fun enterNoBms(
+        settings: AppSettings,
+        chargingOn: Boolean,
+        holdVolts: Double,
+        socTarget: Int
+    ) {
+        if (lastMode != MODE_NO_BMS) {
+            holdEstSyncedThisVisit = false
+            wasInHold = false
+            clearHoldServo()
+            lastCharging = null
+            lastWriteMs = 0L
+            lastWrittenCv = Double.NaN
+            onNoBms()
+        }
+        publish(
+            settings = settings,
+            mode = MODE_NO_BMS,
+            status = "No BMS: EPEVER running its battery profile",
+            commandCv = 0.0,
+            holdVolts = holdVolts,
+            socTarget = socTarget,
+            chargingOn = chargingOn,
+            epeverConnected = true,
+            bmsConnected = false
+        )
+    }
+
+    private fun resetNoBmsWatch() {
+        bmsMissingSinceMs = 0L
     }
 
     private fun idle(settings: AppSettings, epeverConnected: Boolean, bmsReady: Boolean, status: String) {
@@ -315,23 +532,28 @@ class SolarMpptController(
             today - settings.lastBalanceEpochDay >= settings.balanceEveryDays
     }
 
-    private fun currentEpochDay(): Long {
-        val cal = Calendar.getInstance()
-        return cal.timeInMillis / 86_400_000L
-    }
+    private fun currentEpochDay(): Long = localEpochDay()
 
     companion object {
         const val MODE_IDLE = "Idle"
         const val MODE_BULK = "Bulk"
         const val MODE_HOLD = "Hold"
+        const val MODE_TOPUP = "Top-up"
         const val MODE_ALARM = "Alarm"
-        const val MODE_VOLTAGE = "Voltage"
+        const val MODE_NO_BMS = "No BMS"
         const val MODE_UNATTENDED = "Unattended"
+        const val MODE_OUTPUT_OFF = "Off"
 
+        private const val NO_BMS_GRACE_MS = 10_000L
         private const val OFFSET_ALPHA = 0.15
         private const val CV_WRITE_EPS_V = 0.05
+        /** EEPROM: do not rewrite the 15-register block every tick. */
         private const val CV_WRITE_COOLDOWN_MS = 12_000L
         private const val OVERSHOOT_MARGIN_V = 0.15
+        private const val HOLD_SERVO_PERIOD_MS = 5_000L
+        private const val HOLD_RETRY_MS = 2_000L
+        private const val HOLD_WRITE_EPS_V = 0.02
+        private const val HOLD_SUN_STEP_V = 0.10
         private const val ALARM_BASE_HOLD_MS = 60_000L
         private const val ALARM_MAX_HOLD_MS = 1_800_000L
         private const val ALARM_REPEAT_WINDOW_MS = 600_000L

@@ -383,14 +383,8 @@ private fun MpptPanel(
                     if (state.mppt.fault) WarningOrange else TextMuted,
                     Modifier.weight(1f)
                 )
-                ValueTile(
-                    "SOC Target",
-                    state.controller.socTargetPercent.toString(),
-                    "%",
-                    if (state.controller.socTargetPercent >= 100) WarningOrange else BatteryGreen,
-                    Modifier.weight(1f),
-                    onClick = onToggleBalanceToday
-                )
+                val limit = harvestLimit(state)
+                ValueTile("Limit", limit.label, "", limit.color, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile("PV V", "%.2f".format(state.mppt.pvVolts), "V", VoltageAmber, Modifier.weight(1f))
@@ -404,7 +398,7 @@ private fun MpptPanel(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ValueTile(
-                    "Offset",
+                    "ΔV",
                     "%+.2f".format(state.controller.voltageOffset),
                     "V",
                     VoltageAmber,
@@ -450,8 +444,14 @@ private fun MpptPanel(
                     WarningOrange,
                     Modifier.weight(1f)
                 )
-                val limit = harvestLimit(state)
-                ValueTile("Limit", limit.label, "", limit.color, Modifier.weight(1f))
+                ValueTile(
+                    "SOC Target",
+                    state.controller.socTargetPercent.toString(),
+                    "%",
+                    if (state.controller.socTargetPercent >= 100) WarningOrange else BatteryGreen,
+                    Modifier.weight(1f),
+                    onClick = onToggleBalanceToday
+                )
             }
         }
     }
@@ -579,23 +579,26 @@ private fun harvestLimit(state: AppState): HarvestLimit {
     val pvVolts = state.mppt.pvVolts
     val mpptVolts = state.mppt.batteryVolts
     val mode = state.controller.pvMode
-    val charging = when (mode) {
-        "Unattended", "Idle" -> state.mppt.chargingOn
-        else -> state.controller.chargingOn
-    }
     val commandedCv = when {
-        mode == "Unattended" && state.mppt.chargeStage == EpeverChargeStage.Float ->
+        (mode == "Unattended" || mode == "No BMS") && state.mppt.chargeStage == EpeverChargeStage.Float ->
             state.controller.profileFloatVolts
-        mode == "Unattended" -> state.controller.profileBoostVolts
+        mode == "Unattended" || mode == "No BMS" -> state.controller.profileBoostVolts
         state.controller.commandCvVolts > 0.0 -> state.controller.commandCvVolts
         else -> state.settings.maxBatteryVolts
     }
     val noSun = pvWatts < 10.0 && pvVolts < mpptVolts + 1.0
+    val pushing = state.mppt.chargeAmps > 0.4 || state.mppt.chargeWatts > 8.0
+    val holdTarget = state.controller.holdVolts.takeIf { it > 0.0 }
+        ?: state.settings.bmsVoltageHoldVolts
+    val atHoldVoltage = mode == "Hold" && state.battery.volts >= holdTarget - 0.02
+    val atCommandedCv = commandedCv > 0.0 && commandedCv - mpptVolts <= 0.08
     return when {
         noSun -> HarvestLimit("Night", TextMuted)
-        mode == "Alarm" || !charging -> HarvestLimit("Off", DeviceRed)
-        mode == "Hold" -> HarvestLimit("Hold", WarningOrange)
-        commandedCv - mpptVolts <= 0.15 -> HarvestLimit("CV", VoltageAmber)
+        mode == "Off" && pushing -> HarvestLimit("Array", BatteryGreen)
+        mode == "Off" || (mode == "Alarm" && !pushing) -> HarvestLimit("Off", DeviceRed)
+        !pushing && !state.mppt.chargingOn -> HarvestLimit("Off", DeviceRed)
+        atHoldVoltage -> HarvestLimit("Hold", WarningOrange)
+        atCommandedCv && pushing && mode != "Hold" && mode != "Top-up" -> HarvestLimit("CV", VoltageAmber)
         else -> HarvestLimit("Array", BatteryGreen)
     }
 }
@@ -603,10 +606,13 @@ private fun harvestLimit(state: AppState): HarvestLimit {
 private fun modeColor(mode: String): Color {
     return when (mode) {
         "Hold" -> BatteryGreen
-        "Bulk" -> TextMuted
+        "Top-up" -> PowerBlue
+        "Bulk" -> PowerBlue
         "Alarm" -> WarningOrange
-        "Voltage" -> VoltageAmber
+        "No BMS" -> VoltageAmber
         "Unattended" -> WarningOrange
+        "Off" -> DeviceRed
+        "Idle" -> TextMuted
         else -> TextMuted
     }
 }

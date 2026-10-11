@@ -69,6 +69,7 @@ data class ControllerState(
     val socTargetPercent: Int,
     val commandCvVolts: Double = 0.0,
     val voltageOffset: Double = 0.0,
+    val holdVolts: Double = 0.0,
     val chargingOn: Boolean = false,
     val averagePackCurrentA: Double? = null,
     val profileBoostVolts: Double = 14.20,
@@ -85,6 +86,13 @@ data class AlertState(
     val socDriftThresholdPercent: Int = 20
 )
 
+fun localEpochDay(nowMs: Long = System.currentTimeMillis()): Long {
+    return java.time.Instant.ofEpochMilli(nowMs)
+        .atZone(java.time.ZoneId.systemDefault())
+        .toLocalDate()
+        .toEpochDay()
+}
+
 data class AppSettings(
     val maxBatteryVolts: Double,
     val bmsOfflineMaxBatteryVolts: Double,
@@ -93,7 +101,6 @@ data class AppSettings(
     val controllerEnabled: Boolean,
     val normalSocCeilingPercent: Int,
     val normalSocResumePercent: Int,
-    val bmsCurrentDeadbandAmps: Double,
     val lowSocAlarmPercent: Int,
     val socDriftDeadbandAmps: Double,
     val socDriftAlarmPercent: Int,
@@ -191,7 +198,6 @@ data class AppState(
                 controllerEnabled = true,
                 normalSocCeilingPercent = 95,
                 normalSocResumePercent = 93,
-                bmsCurrentDeadbandAmps = 1.0,
                 lowSocAlarmPercent = 20,
                 socDriftDeadbandAmps = 1.5,
                 socDriftAlarmPercent = 20,

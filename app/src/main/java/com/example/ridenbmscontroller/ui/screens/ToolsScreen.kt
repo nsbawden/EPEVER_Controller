@@ -51,11 +51,16 @@ fun ToolsScreen(
     profile: EpeverBatteryProfile,
     epeverConnected: Boolean,
     epeverClock: EpeverClock?,
+    deviceProfile: EpeverBatteryProfile?,
+    commandCvVolts: Double,
+    lastWriteNote: String?,
     mppt: MpptState,
     status: String,
     modifier: Modifier = Modifier,
     onRefreshFromEpever: () -> Unit,
     onUnattendedModeChanged: (Boolean) -> Unit,
+    chargeOutputOn: Boolean,
+    onChargeOutputChanged: (Boolean) -> Unit,
     onProfileChanged: (EpeverBatteryProfile, writeToEpever: Boolean) -> Unit,
     onSyncClockFromPhone: () -> Unit,
     onClearGeneratedEnergy: () -> Unit
@@ -115,6 +120,78 @@ fun ToolsScreen(
                 Button(onClick = onRefreshFromEpever, modifier = Modifier.fillMaxWidth(), enabled = epeverConnected) {
                     Text("Read EPEVER now")
                 }
+            }
+        }
+
+        ProfileGroup("Charge output") {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("MPPT charge output", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (chargeOutputOn) "On" else "Off — live writes paused",
+                        color = if (chargeOutputOn) BatteryGreen else WarningOrange,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Switch(
+                    checked = chargeOutputOn,
+                    onCheckedChange = onChargeOutputChanged,
+                    enabled = epeverConnected
+                )
+            }
+            Text(
+                if (chargeOutputOn) {
+                    "On restores the previous voltage block and resumes the live loop."
+                } else {
+                    "Tracer-AN coil 0x0000 does not stop charge. Off writes the full battery block to 13.00 V and pauses further writes. Watch Boost/Float and MPPT A."
+                },
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+        }
+
+        ProfileGroup("Controller settings (live)") {
+            Text(
+                "Read-only values from the EPEVER. MPPT V on the dashboard is measured battery voltage, not these setpoints.",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            if (!lastWriteNote.isNullOrBlank()) {
+                Text(lastWriteNote, color = WarningOrange, fontSize = 13.sp)
+            }
+            if (deviceProfile == null) {
+                Text(if (epeverConnected) "Reading…" else "Disconnected", color = TextMuted)
+            } else {
+                ClockRow("Battery type", deviceProfile.batteryTypeLabel)
+                ClockRow("Capacity", "${deviceProfile.capacityAh} Ah")
+                ClockRow("Temp compensation", "%.2f mV/°C/2V".format(deviceProfile.tempCompensationMvv))
+                if (commandCvVolts > 0.0) {
+                    ClockRow("App command CV", "%.2f V".format(commandCvVolts))
+                    val deviceCv = deviceProfile.regulationVolts
+                    if (kotlin.math.abs(commandCvVolts - deviceCv) >= 0.05) {
+                        Text(
+                            "EPEVER still at %.2f V — last command did not stick.".format(deviceCv),
+                            color = WarningOrange,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+                ClockRow("High voltage disconnect", "%.2f V".format(deviceProfile.highVoltageDisconnect))
+                ClockRow("Charging limit", "%.2f V".format(deviceProfile.chargingLimitVolts))
+                ClockRow("Over voltage reconnect", "%.2f V".format(deviceProfile.overVoltageReconnect))
+                ClockRow("Equalize", "%.2f V".format(deviceProfile.equalizeVolts))
+                ClockRow("Boost", "%.2f V".format(deviceProfile.boostVolts))
+                ClockRow("Float", "%.2f V".format(deviceProfile.floatVolts))
+                ClockRow("Boost reconnect", "%.2f V".format(deviceProfile.boostReconnectVolts))
+                ClockRow("Low voltage reconnect", "%.2f V".format(deviceProfile.lowVoltageReconnect))
+                ClockRow("Under voltage recover", "%.2f V".format(deviceProfile.underVoltageRecover))
+                ClockRow("Under voltage warning", "%.2f V".format(deviceProfile.underVoltageWarning))
+                ClockRow("Low voltage disconnect", "%.2f V".format(deviceProfile.lowVoltageDisconnect))
+                ClockRow("Discharging limit", "%.2f V".format(deviceProfile.dischargingLimitVolts))
             }
         }
 

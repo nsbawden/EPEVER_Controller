@@ -26,7 +26,33 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
+/**
+ * Tracer-AN Modbus RTU (115200 8N1, slave 1) on the official XR21V1410 USB cable.
+ *
+ * Charge voltages live in EEPROM. Firmware accepts a custom curve only when battery
+ * type is User (0) **and** 0x9000–0x900E are written together as one 15-register FC10.
+ * Partial writes (FC06, or 3/7/10-register FC10) are rejected: Boost/Float stay at
+ * the last good values (we saw Tools stuck at 13.60 V).
+ *
+ * Live / park / unattended writes: read the current 15-register block, overlay the
+ * voltages, write the whole block. Do not write User type as its own transaction —
+ * type 0 rides along in that block. Do not poke 0x9000 on a timer.
+ *
+ * Coil 0x0000 (charging) is a no-op on AN (AN coils 2/3/5/6 are load). It does not
+ * stop harvest. Manual Off parks the same 15-register block at 13.00 V — Tools only,
+ * never from the live loop (EEPROM wear, and it is a blunt inhibit). Clear generated
+ * energy is coil 0x0014, not 0x0006.
+ *
+ * After a voltage write, wait ~400 ms and read back. If limit/Boost/Float/equalize
+ * do not match, rewrite from the **readback**, not a stale local copy. Large downward
+ * steps should walk through a midpoint so the firmware does not reject the jump.
+ *
+ * boostReconnect must be > LVR + 0.02 V or the block is rejected.
+ * Input 0x3104 is measured battery voltage (dashboard MPPT V), not commanded CV.
+ * Energy words are 0.01 kWh.
+ */
 class EpeverUsbMonitor(
     context: Context,
     private val scope: CoroutineScope,
@@ -40,6 +66,7 @@ class EpeverUsbMonitor(
     private var permissionRequestInFlight = false
     private var currentIo: ModbusIo? = null
     private val ioMutex = Mutex()
+    private var parkedProfile: EpeverBatteryProfile? = null
 
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -129,14 +156,19 @@ class EpeverUsbMonitor(
                     )
                     var sampleSeq = 0L
                     while (isActive) {
-                        val (telemetry, clock) = ioMutex.withLock {
+                        val snapshot = ioMutex.withLock {
                             val nextTelemetry = readTelemetry(io)
                             val nextClock = if (sampleSeq % 5L == 0L) {
                                 runCatching { readClock(io) }.getOrNull()
                             } else {
                                 null
                             }
-                            nextTelemetry to nextClock
+                            val nextProfile = if (sampleSeq % 5L == 2L) {
+                                runCatching { readBatteryProfile(io) }.getOrNull()
+                            } else {
+                                null
+                            }
+                            Triple(nextTelemetry, nextClock, nextProfile)
                         }
                         sampleSeq += 1L
                         publishOnMain(
@@ -144,9 +176,11 @@ class EpeverUsbMonitor(
                                 connected = true,
                                 permissionNeeded = false,
                                 status = "EPEVER live",
-                                telemetry = telemetry,
+                                telemetry = snapshot.first,
                                 telemetrySampleSeq = sampleSeq,
-                                clock = clock ?: state.clock
+                                clock = snapshot.second ?: state.clock,
+                                deviceProfile = snapshot.third ?: state.deviceProfile,
+                                lastWriteNote = state.lastWriteNote
                             )
                         )
                         delay(POLL_MS)
@@ -167,13 +201,96 @@ class EpeverUsbMonitor(
         }
     }
 
+    /** Tracer-AN ignores this coil. Kept for protocol completeness; do not use as inhibit. */
     fun setCharging(enabled: Boolean) {
         scope.launch(Dispatchers.IO) {
-            val io = currentIo ?: return@launch
+            val io = currentIo
+            if (io == null) {
+                publishOnMain(state.copy(status = "Charge coil skipped: USB not ready"))
+                return@launch
+            }
             runCatching {
                 ioMutex.withLock { io.writeSingleCoil(SLAVE_ID, COIL_CHARGING, enabled) }
             }.onFailure {
                 publishOnMain(state.copy(status = "Charge coil failed: ${it.message ?: it.javaClass.simpleName}"))
+            }
+        }
+    }
+
+    /** Tools-only inhibit: full 15-register park at [PARK_CHARGE_VOLTS]. Do not call from Live. */
+    fun parkChargeOutput(onDone: (Result<EpeverBatteryProfile>) -> Unit = {}) {
+        applyParkedVoltages(PARK_CHARGE_VOLTS, saveCurrent = true, onDone)
+    }
+
+    fun restoreParkedChargeOutput(onDone: (Result<EpeverBatteryProfile>) -> Unit = {}) {
+        val stored = parkedProfile
+        if (stored == null) {
+            onDone(Result.failure(IllegalStateException("No parked profile to restore")))
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onDone(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock {
+                    writeBatteryProfile(io, stored)
+                    delay(400)
+                    readBatteryProfile(io)
+                }
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { publish(state.copy(deviceProfile = it)) }
+                onDone(result)
+            }
+        }
+    }
+
+    /** Walk a large drop through a midpoint, then full-block write + readback. */
+    private fun applyParkedVoltages(
+        parkVolts: Double,
+        saveCurrent: Boolean,
+        onDone: (Result<EpeverBatteryProfile>) -> Unit
+    ) {
+        val profile = EpeverVoltageProfile.hold(parkVolts, parkVolts)
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onDone(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock {
+                    val current = readBatteryProfile(io)
+                    if (saveCurrent) parkedProfile = current
+                    var working = current
+                    val from = current.regulationVolts
+                    if (from > parkVolts + 0.15) {
+                        val mid = (from + parkVolts) / 2.0
+                        writeBatteryProfile(io, working.withLiveVoltages(EpeverVoltageProfile.hold(mid, mid)))
+                        delay(400)
+                        working = readBatteryProfile(io)
+                    }
+                    writeBatteryProfile(io, working.withLiveVoltages(profile))
+                    delay(400)
+                    var readback = readBatteryProfile(io)
+                    if (!readback.matchesLive(profile)) {
+                        writeBatteryProfile(io, readback.withLiveVoltages(profile))
+                        delay(400)
+                        readback = readBatteryProfile(io)
+                    }
+                    readback
+                }
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { publish(state.copy(deviceProfile = it)) }
+                onDone(result)
             }
         }
     }
@@ -190,10 +307,14 @@ class EpeverUsbMonitor(
             val result = runCatching {
                 ioMutex.withLock { readBatteryProfile(io) }
             }
-            withContext(Dispatchers.Main) { onResult(result) }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { publish(state.copy(deviceProfile = it)) }
+                onResult(result)
+            }
         }
     }
 
+    /** Full 15-register Tools / unattended / No-BMS profile. Same atomic rule as live writes. */
     fun writeBatteryProfile(profile: EpeverBatteryProfile, onResult: (Result<Unit>) -> Unit = {}) {
         scope.launch(Dispatchers.IO) {
             val io = currentIo
@@ -210,6 +331,7 @@ class EpeverUsbMonitor(
         }
     }
 
+    /** Type / capacity / LVR only — still written as the full 15-register block. */
     fun writeProtectionParams(profile: EpeverBatteryProfile, onResult: (Result<Unit>) -> Unit = {}) {
         scope.launch(Dispatchers.IO) {
             val io = currentIo
@@ -226,6 +348,7 @@ class EpeverUsbMonitor(
         }
     }
 
+    /** Coil 0x0014. 0x0006 is a different (wrong) coil. */
     fun clearGeneratedEnergy(onResult: (Result<Unit>) -> Unit = {}) {
         scope.launch(Dispatchers.IO) {
             val io = currentIo
@@ -283,24 +406,56 @@ class EpeverUsbMonitor(
         }
     }
 
-    fun applyVoltageProfile(profile: EpeverVoltageProfile) {
+    /**
+     * Live CV change: read-modify-write the full 0x9000–0x900E block, then 400 ms readback.
+     * User type is forced only inside that block ([EpeverBatteryProfile.withLiveVoltages]).
+     */
+    fun applyVoltageProfile(profile: EpeverVoltageProfile, onDone: (Boolean) -> Unit = {}) {
         scope.launch(Dispatchers.IO) {
-            val io = currentIo ?: return@launch
-            runCatching {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) { onDone(false) }
+                return@launch
+            }
+            val result = runCatching {
                 ioMutex.withLock {
-                    val values = intArrayOf(
-                        toRegV(profile.highVoltageDisconnect),
-                        toRegV(profile.chargeLimitVolts),
-                        toRegV(profile.overVoltageReconnect),
-                        toRegV(profile.equalizeVolts),
-                        toRegV(profile.boostVolts),
-                        toRegV(profile.floatVolts),
-                        toRegV(profile.boostReconnectVolts)
-                    )
-                    io.writeHoldingRegs(SLAVE_ID, REG_HVD, values)
+                    val current = runCatching { readBatteryProfile(io) }.getOrNull()
+                        ?: EpeverBatteryProfile()
+                    writeBatteryProfile(io, current.withLiveVoltages(profile))
+                    delay(400)
+                    var readback = readBatteryProfile(io)
+                    if (!readback.matchesLive(profile)) {
+                        writeBatteryProfile(io, readback.withLiveVoltages(profile))
+                        delay(400)
+                        readback = readBatteryProfile(io)
+                    }
+                    readback
                 }
-            }.onFailure {
-                publishOnMain(state.copy(status = "Voltage profile failed: ${it.message ?: it.javaClass.simpleName}"))
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { device ->
+                    val ok = device.matchesLive(profile)
+                    val note = if (ok) {
+                        "Live CV %.2f V written".format(profile.boostVolts)
+                    } else {
+                        "Live CV %.2f V rejected (Boost %.2f Float %.2f)".format(
+                            profile.boostVolts,
+                            device.boostVolts,
+                            device.floatVolts
+                        )
+                    }
+                    publish(
+                        state.copy(
+                            deviceProfile = device,
+                            status = note,
+                            lastWriteNote = note
+                        )
+                    )
+                    onDone(ok)
+                }.onFailure {
+                    publish(state.copy(status = "Voltage profile failed: ${it.message ?: it.javaClass.simpleName}"))
+                    onDone(false)
+                }
             }
         }
     }
@@ -335,29 +490,29 @@ class EpeverUsbMonitor(
         )
     }
 
+    /** Always the full 15-register FC10. Never FC06 or a short slice of 0x9000–0x900E. */
     private suspend fun writeBatteryProfile(io: ModbusIo, profile: EpeverBatteryProfile) {
         io.writeHoldingRegs(SLAVE_ID, REG_BATTERY_TYPE, profile.toRegisterBlock())
     }
 
+    /**
+     * Type / capacity / LVR changes still need the full voltage block. A 3-register
+     * write of User type + capacity is rejected or leaves Boost/Float unchanged.
+     * Overlay onto the device block so Live CVs are not clobbered.
+     */
     private suspend fun writeProtectionParams(io: ModbusIo, profile: EpeverBatteryProfile) {
-        io.writeHoldingRegs(
-            SLAVE_ID,
-            REG_BATTERY_TYPE,
-            intArrayOf(
-                profile.batteryType.coerceIn(0, 5),
-                profile.capacityAh.coerceIn(1, 3000),
-                toRegTempComp(profile.tempCompensationMvv)
-            )
-        )
-        io.writeHoldingRegs(
-            SLAVE_ID,
-            REG_LVR,
-            intArrayOf(
-                toRegV(profile.lowVoltageReconnect),
-                toRegV(profile.underVoltageRecover),
-                toRegV(profile.underVoltageWarning),
-                toRegV(profile.lowVoltageDisconnect),
-                toRegV(profile.dischargingLimitVolts)
+        val current = readBatteryProfile(io)
+        writeBatteryProfile(
+            io,
+            current.copy(
+                batteryType = profile.batteryType,
+                capacityAh = profile.capacityAh,
+                tempCompensationMvv = profile.tempCompensationMvv,
+                lowVoltageReconnect = profile.lowVoltageReconnect,
+                underVoltageRecover = profile.underVoltageRecover,
+                underVoltageWarning = profile.underVoltageWarning,
+                lowVoltageDisconnect = profile.lowVoltageDisconnect,
+                dischargingLimitVolts = profile.dischargingLimitVolts
             )
         )
     }
@@ -473,21 +628,31 @@ class EpeverUsbMonitor(
         private const val ACTION_USB_PERMISSION = "com.example.emppt.USB_PERMISSION"
         private const val SLAVE_ID = 1
         private const val POLL_MS = 400L
+        /** Documented on BN/AN; AN firmware does not honor it for charge output. */
         private const val COIL_CHARGING = 0x0000
         private const val COIL_CLEAR_GENERATED_ENERGY = 0x0014
+        private const val PARK_CHARGE_VOLTS = 13.00
+        /** 0x3104 in this block is measured battery V (dashboard MPPT V). */
         private const val REG_REALTIME = 0x3100
         private const val REG_CHARGING_STATUS = 0x3201
         private const val REG_STATS = 0x3300
+        /** Start of the 15-register battery block that must be written atomically. */
         private const val REG_BATTERY_TYPE = 0x9000
-        private const val REG_HVD = 0x9003
-        private const val REG_LVR = 0x900A
         private const val REG_RTC = 0x9013
 
-        private fun toRegV(volts: Double): Int = (volts * 100.0).toInt().coerceIn(0, 1500)
+        private fun toRegV(volts: Double): Int = kotlin.math.round(volts * 100.0).toInt().coerceIn(0, 1500)
         private fun fromRegV(raw: Int): Double = (raw and 0xFFFF) / 100.0
         private fun toRegTempComp(value: Double): Int = (value * 100.0).toInt().coerceIn(0, 900)
         private fun fromRegTempComp(raw: Int): Double = raw.toShort().toInt() / 100.0
 
+        private fun EpeverBatteryProfile.matchesLive(profile: EpeverVoltageProfile): Boolean {
+            return abs(chargingLimitVolts - profile.chargeLimitVolts) < 0.06 &&
+                abs(boostVolts - profile.boostVolts) < 0.06 &&
+                abs(floatVolts - profile.floatVolts) < 0.06 &&
+                abs(equalizeVolts - profile.equalizeVolts) < 0.06
+        }
+
+        /** 15 words: type, Ah, temp-comp, HVD, limit, OVR, EQ, boost, float, boost-rec, LVR…DLV. */
         private fun EpeverBatteryProfile.toRegisterBlock(): IntArray {
             return intArrayOf(
                 batteryType.coerceIn(0, 5),
