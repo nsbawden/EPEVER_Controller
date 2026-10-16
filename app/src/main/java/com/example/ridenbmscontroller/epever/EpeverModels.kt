@@ -120,7 +120,8 @@ data class EpeverUsbState(
     val clock: EpeverClock? = null,
     val deviceProfile: EpeverBatteryProfile? = null,
     val extendedSettings: EpeverExtendedSettings? = null,
-    val lastWriteNote: String? = null
+    val lastWriteNote: String? = null,
+    val lastEepromWriteMs: Long = 0L
 )
 
 /** Non-load settings outside the 0x9000–0x900E voltage block. */
@@ -200,6 +201,47 @@ data class EpeverBatteryProfile(
         )
     }
 
+    /** Keep Tools voltage setpoints; take type / Ah / temp-comp from a device read. */
+    fun mergeKeepingVoltageSetpoints(device: EpeverBatteryProfile): EpeverBatteryProfile {
+        return device.copy(
+            highVoltageDisconnect = highVoltageDisconnect,
+            chargingLimitVolts = chargingLimitVolts,
+            overVoltageReconnect = overVoltageReconnect,
+            equalizeVolts = equalizeVolts,
+            boostVolts = boostVolts,
+            floatVolts = floatVolts,
+            boostReconnectVolts = boostReconnectVolts,
+            lowVoltageReconnect = lowVoltageReconnect,
+            underVoltageRecover = underVoltageRecover,
+            underVoltageWarning = underVoltageWarning,
+            lowVoltageDisconnect = lowVoltageDisconnect,
+            dischargingLimitVolts = dischargingLimitVolts
+        )
+    }
+
+    /**
+     * Add [cal] to every voltage in the 15-register block for Unattended / No BMS
+     * writes. Tools fields stay unadjusted. Clamp on the wire only.
+     */
+    fun withVoltageCal(cal: Double): EpeverBatteryProfile {
+        if (kotlin.math.abs(cal) < 0.0005) return this
+        fun adj(volts: Double) = (volts + cal).coerceIn(CAL_WRITE_MIN_V, CAL_WRITE_MAX_V)
+        return copy(
+            highVoltageDisconnect = adj(highVoltageDisconnect),
+            chargingLimitVolts = adj(chargingLimitVolts),
+            overVoltageReconnect = adj(overVoltageReconnect),
+            equalizeVolts = adj(equalizeVolts),
+            boostVolts = adj(boostVolts),
+            floatVolts = adj(floatVolts),
+            boostReconnectVolts = adj(boostReconnectVolts),
+            lowVoltageReconnect = adj(lowVoltageReconnect),
+            underVoltageRecover = adj(underVoltageRecover),
+            underVoltageWarning = adj(underVoltageWarning),
+            lowVoltageDisconnect = adj(lowVoltageDisconnect),
+            dischargingLimitVolts = adj(dischargingLimitVolts)
+        )
+    }
+
     /**
      * Overlay live CVs onto a device-read block. Type 0 (User) belongs in this same
      * write — do not send User as a separate 0x9000 transaction beforehand.
@@ -223,6 +265,9 @@ data class EpeverBatteryProfile(
     }
 
     companion object {
+        const val CAL_WRITE_MIN_V = 9.0
+        const val CAL_WRITE_MAX_V = 17.0
+
         fun batteryTypeLabel(type: Int): String = when (type) {
             1 -> "Sealed"
             2 -> "Gel"

@@ -84,8 +84,18 @@ fun SettingsScreen(
             NumberFieldRow("Ceiling hold voltage", settings.bmsVoltageHoldVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(bmsVoltageHoldVolts = it))
             }
+            NumberFieldRow("Hold sag", settings.holdSagVolts, "V", 0.02, 0.50) {
+                onSettingsChanged(settings.copy(holdSagVolts = it))
+            }
+            IntFieldRow("Hold sag time", settings.holdSagDwellS, "s", 5, 600) {
+                onSettingsChanged(settings.copy(holdSagDwellS = it))
+            }
             IntFieldRow("Resume SOC", settings.normalSocResumePercent, "%", 50, 99) {
-                onSettingsChanged(settings.copy(normalSocResumePercent = it.coerceAtMost(settings.normalSocCeilingPercent - 1)))
+                onSettingsChanged(
+                    settings.copy(
+                        normalSocResumePercent = it.coerceAtMost(settings.normalSocCeilingPercent - 1)
+                    )
+                )
             }
             NumberFieldRow("100% hold voltage", settings.fullHoldVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(fullHoldVolts = it))

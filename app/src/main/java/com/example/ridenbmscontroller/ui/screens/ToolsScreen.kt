@@ -54,6 +54,8 @@ fun ToolsScreen(
     epeverConnected: Boolean,
     epeverClock: EpeverClock?,
     mppt: MpptState,
+    bmsVolts: Double,
+    bmsAmps: Double,
     status: String,
     modifier: Modifier = Modifier,
     onRefreshFromEpever: () -> Unit,
@@ -62,6 +64,8 @@ fun ToolsScreen(
     onChargeOutputChanged: (Boolean) -> Unit,
     onProfileChanged: (EpeverBatteryProfile, writeToEpever: Boolean) -> Unit,
     onExtendedChanged: (EpeverExtendedSettings) -> Unit,
+    voltageCal: Double,
+    onVoltageCalChanged: (Double) -> Unit,
     onSyncClockFromPhone: () -> Unit,
     onClearGeneratedEnergy: () -> Unit
 ) {
@@ -239,9 +243,26 @@ fun ToolsScreen(
             NumberField("Line impedance", extended.lineImpedanceMOhm, "mΩ", 0.0, 200.0) {
                 onExtendedChanged(extended.copy(lineImpedanceMOhm = it))
             }
+            Text(
+                "Live writes 0 mΩ so the commanded CV is not raised. This value is used in Unattended and No BMS.",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            ClockRow(
+                "Live ΔV / A",
+                liveLineImpedanceMOhm(mppt.batteryVolts, bmsVolts, mppt.chargeAmps, bmsAmps, voltageCal)
+                    ?.let { "%.2f mΩ".format(it) }
+                    ?: "— (need charge current)"
+            )
         }
 
         ProfileGroup(if (unattendedMode) "Charge voltages" else "Unattended charge voltages") {
+            NumberField("EPEVER voltage cal", voltageCal, "V", -0.50, 0.50, onVoltageCalChanged)
+            Text(
+                "Positive if MPPT V reads high. Added only when writing the Unattended profile. Live CV, park, and reads stay raw. 0 = off. Read EPEVER does not overwrite these voltages while cal is not 0.",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
             NumberField("High voltage disconnect", profile.highVoltageDisconnect, "V", 12.0, 15.0) {
                 onProfileChanged(profile.copy(highVoltageDisconnect = it), unattendedMode)
             }
@@ -263,11 +284,26 @@ fun ToolsScreen(
             IntField("Boost duration", extended.boostDurationMin, "min", 10, 180) {
                 onExtendedChanged(extended.copy(boostDurationMin = it))
             }
+        }
+
+        ProfileGroup("SOC charging") {
+            Text(
+                if (extended.chargeManagementSoc) {
+                    "SOC mode: Unattended uses Charge percent as the Tracer's own full-charge SOC (Ah count, not BMS). Discharge percent is a load cutoff — unused on this 80A. Live still uses BMS SOC."
+                } else {
+                    "Voltage mode (in use): Unattended follows the voltage cards. Charge percent and Discharge percent are stored but ignored. Live uses BMS SOC, not these."
+                },
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            CycleRow("Charge management", extended.chargeManagementLabel) {
+                onExtendedChanged(extended.copy(chargeManagementSoc = !extended.chargeManagementSoc))
+            }
             IntField("Charge percent", extended.chargePercent, "%", 0, 100) {
                 onExtendedChanged(extended.copy(chargePercent = it))
             }
-            CycleRow("Charge management", extended.chargeManagementLabel) {
-                onExtendedChanged(extended.copy(chargeManagementSoc = !extended.chargeManagementSoc))
+            IntField("Discharge percent", extended.dischargePercent, "%", 0, 100) {
+                onExtendedChanged(extended.copy(dischargePercent = it))
             }
         }
 
@@ -303,9 +339,6 @@ fun ToolsScreen(
             }
             NumberField("Discharging limit", profile.dischargingLimitVolts, "V", 10.0, 14.0) {
                 onProfileChanged(profile.copy(dischargingLimitVolts = it), true)
-            }
-            IntField("Discharge percent", extended.dischargePercent, "%", 0, 100) {
-                onExtendedChanged(extended.copy(dischargePercent = it))
             }
         }
     }
@@ -343,6 +376,20 @@ private fun ClockRow(label: String, value: String) {
 }
 
 private fun Double?.formatVolts(): String = this?.takeIf { it > 0.0 }?.let { "%.2f V".format(it) } ?: "—"
+
+private fun liveLineImpedanceMOhm(
+    mpptVolts: Double,
+    bmsVolts: Double,
+    mpptAmps: Double,
+    bmsAmps: Double,
+    voltageCal: Double
+): Double? {
+    if (mpptVolts <= 0.0 || bmsVolts <= 0.0) return null
+    val amps = maxOf(mpptAmps, bmsAmps)
+    if (amps < 3.0) return null
+    val milliOhm = (mpptVolts - voltageCal - bmsVolts) / amps * 1000.0
+    return milliOhm.takeIf { it in -50.0..200.0 }
+}
 
 @Composable
 private fun CycleRow(label: String, value: String, onCycle: () -> Unit) {

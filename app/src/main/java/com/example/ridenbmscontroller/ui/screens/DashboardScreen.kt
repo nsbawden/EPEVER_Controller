@@ -65,6 +65,7 @@ import com.example.ridenbmscontroller.ui.theme.TextMuted
 import com.example.ridenbmscontroller.ui.theme.TextPrimary
 import com.example.ridenbmscontroller.ui.theme.VoltageAmber
 import com.example.ridenbmscontroller.ui.theme.WarningOrange
+import kotlinx.coroutines.delay
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sin
@@ -77,7 +78,8 @@ fun DashboardScreen(
     onSilenceSocDriftAlarm: () -> Unit = {},
     onPressureTileClick: () -> Unit = {},
     onToggleBalanceToday: () -> Unit = {},
-    onManualCvChanged: (enabled: Boolean, volts: Double) -> Unit = { _, _ -> }
+    onManualCvChanged: (enabled: Boolean, volts: Double) -> Unit = { _, _ -> },
+    onToggleMpptCalDisplay: () -> Unit = {}
 ) {
     Column(
         modifier = modifier
@@ -88,7 +90,7 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         BatteryGaugeCard(state, onSilenceLowSocAlarm, onSilenceSocDriftAlarm)
-        MpptPanel(state, onPressureTileClick, onToggleBalanceToday, onManualCvChanged)
+        MpptPanel(state, onPressureTileClick, onToggleBalanceToday, onManualCvChanged, onToggleMpptCalDisplay)
     }
 }
 
@@ -359,9 +361,17 @@ private fun MpptPanel(
     state: AppState,
     onPressureTileClick: () -> Unit,
     onToggleBalanceToday: () -> Unit,
-    onManualCvChanged: (enabled: Boolean, volts: Double) -> Unit
+    onManualCvChanged: (enabled: Boolean, volts: Double) -> Unit,
+    onToggleMpptCalDisplay: () -> Unit
 ) {
     var showManualCv by remember { mutableStateOf(false) }
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1_000)
+            nowMs = System.currentTimeMillis()
+        }
+    }
     Surface(
         color = Panel,
         shape = RoundedCornerShape(8.dp),
@@ -395,18 +405,40 @@ private fun MpptPanel(
                 ValueTile("PV A", "%.2f".format(state.mppt.pvAmps), "A", CurrentRose, Modifier.weight(1f))
                 ValueTile("PV W", "%.0f".format(state.mppt.pvWatts), "W", PowerBlue, Modifier.weight(1f))
             }
+            val showCal = state.settings.showMpptCalVolts
+            val voltageCal = state.settings.epeverVoltageCal
+            val mpptTileColor = if (showCal) WarningOrange else VoltageAmber
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ValueTile("MPPT V", "%.2f".format(state.mppt.batteryVolts), "V", VoltageAmber, Modifier.weight(1f))
+                val mpptVolts = state.mppt.batteryVolts
+                val tileVolts = if (showCal && mpptVolts > 0.0) {
+                    mpptVolts - voltageCal
+                } else {
+                    mpptVolts
+                }
+                ValueTile(
+                    if (showCal) "CAL V" else "MPPT V",
+                    "%.2f".format(tileVolts),
+                    "V",
+                    mpptTileColor,
+                    Modifier.weight(1f),
+                    onClick = onToggleMpptCalDisplay
+                )
                 ValueTile("MPPT A", "%.2f".format(state.mppt.chargeAmps), "A", CurrentRose, Modifier.weight(1f))
                 ValueTile("MPPT W", "%.0f".format(state.mppt.chargeWatts), "W", PowerBlue, Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val deltaV = if (showCal) {
+                    state.controller.voltageOffset - voltageCal
+                } else {
+                    state.controller.voltageOffset
+                }
                 ValueTile(
-                    "ΔV",
-                    "%+.2f".format(state.controller.voltageOffset),
+                    if (showCal) "CAL ΔV" else "ΔV",
+                    "%+.2f".format(deltaV),
                     "V",
-                    VoltageAmber,
-                    Modifier.weight(1f)
+                    mpptTileColor,
+                    Modifier.weight(1f),
+                    onClick = onToggleMpptCalDisplay
                 )
                 val displayCv = if (state.settings.manualCvEnabled) {
                     state.settings.manualCvVolts
@@ -455,12 +487,13 @@ private fun MpptPanel(
                     Modifier.weight(1f),
                     onClick = onToggleBalanceToday
                 )
+                val eeprom = eepromAge(state.controller.lastEepromWriteMs, nowMs)
+                ValueTile("EEPROM", eeprom.value, eeprom.unit, TextMuted, Modifier.weight(1f))
             }
         }
     }
     if (showManualCv) {
         ManualCvDialog(
-            currentAutoCv = state.controller.commandCvVolts,
             manualEnabled = state.settings.manualCvEnabled,
             manualVolts = state.settings.manualCvVolts,
             onDismiss = { showManualCv = false },
@@ -474,19 +507,13 @@ private fun MpptPanel(
 
 @Composable
 private fun ManualCvDialog(
-    currentAutoCv: Double,
     manualEnabled: Boolean,
     manualVolts: Double,
     onDismiss: () -> Unit,
     onConfirm: (enabled: Boolean, volts: Double) -> Unit
 ) {
     var enabled by remember { mutableStateOf(manualEnabled) }
-    val seed = when {
-        manualEnabled -> manualVolts
-        currentAutoCv > 0.0 -> currentAutoCv
-        else -> manualVolts
-    }
-    var text by remember { mutableStateOf("%.2f".format(seed)) }
+    var text by remember { mutableStateOf("%.2f".format(manualVolts)) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Charge CV") },
@@ -500,13 +527,7 @@ private fun ManualCvDialog(
                     Text("Manual", fontWeight = FontWeight.SemiBold)
                     Switch(
                         checked = enabled,
-                        onCheckedChange = { on ->
-                            enabled = on
-                            if (on && !manualEnabled) {
-                                val auto = if (currentAutoCv > 0.0) currentAutoCv else manualVolts
-                                text = "%.2f".format(auto)
-                            }
-                        }
+                        onCheckedChange = { enabled = it }
                     )
                 }
                 if (enabled) {
@@ -538,7 +559,7 @@ private fun ManualCvDialog(
         confirmButton = {
             TextButton(
                 onClick = {
-                    val volts = text.toDoubleOrNull() ?: seed
+                    val volts = text.toDoubleOrNull() ?: manualVolts
                     onConfirm(enabled, volts)
                 }
             ) { Text("OK") }
@@ -655,6 +676,22 @@ internal fun ValueTile(
 
 private data class CompactEnergy(val value: String, val unit: String)
 
+private data class EepromAge(val value: String, val unit: String)
+
+private fun eepromAge(lastWriteMs: Long, nowMs: Long): EepromAge {
+    if (lastWriteMs <= 0L) return EepromAge("—", "")
+    val seconds = ((nowMs - lastWriteMs).coerceAtLeast(0L)) / 1000.0
+    return when {
+        seconds < 60.0 -> EepromAge("%.0f".format(seconds), "s")
+        seconds < 3_600.0 -> EepromAge(
+            if (seconds < 600.0) "%.1f".format(seconds / 60.0) else "%.0f".format(seconds / 60.0),
+            "min"
+        )
+        seconds < 86_400.0 -> EepromAge("%.1f".format(seconds / 3_600.0), "h")
+        else -> EepromAge("%.1f".format(seconds / 86_400.0), "d")
+    }
+}
+
 private val DeviceRed = Color(0xFFFF4D4D)
 
 private fun String.tileValueFontSize() = when {
@@ -682,11 +719,13 @@ private fun harvestLimit(state: AppState): HarvestLimit {
     val pushing = state.mppt.chargeAmps > 0.4 || state.mppt.chargeWatts > 8.0
     val holdTarget = state.controller.holdVolts.takeIf { it > 0.0 }
         ?: state.settings.bmsVoltageHoldVolts
-    val atHoldVoltage = mode == "Hold" && state.battery.volts >= holdTarget - 0.02
+    val holdOrTopup = mode == "Hold" || mode == "Top-up"
+    val atHoldVoltage = holdOrTopup &&
+        state.battery.volts >= holdTarget - state.settings.holdSagVolts
     val atCommandedCv = commandedCv > 0.0 && commandedCv - mpptVolts <= 0.08
     val iMax = state.settings.maxChargeAmps
-    val live = mode == "Bulk" || mode == "Hold" || mode == "Top-up"
-    val policyCv = if (mode == "Hold" || mode == "Top-up") holdTarget else state.settings.maxBatteryVolts
+    val live = mode == "Bulk" || holdOrTopup
+    val policyCv = if (holdOrTopup) holdTarget else state.settings.maxBatteryVolts
     val chargeAmps = state.battery.amps.coerceAtLeast(0.0)
     val limiting = live &&
         !state.settings.manualCvEnabled &&
@@ -699,7 +738,8 @@ private fun harvestLimit(state: AppState): HarvestLimit {
         mode == "Off" || (mode == "Alarm" && !pushing) -> HarvestLimit("Off", DeviceRed)
         !pushing && !state.mppt.chargingOn -> HarvestLimit("Off", DeviceRed)
         atHoldVoltage -> HarvestLimit("Hold", WarningOrange)
-        atCommandedCv && pushing && mode != "Hold" && mode != "Top-up" -> HarvestLimit("CV", VoltageAmber)
+        mode == "Top-up" && pushing -> HarvestLimit("Array", BatteryGreen)
+        atCommandedCv && pushing -> HarvestLimit("CV", VoltageAmber)
         else -> HarvestLimit("Array", BatteryGreen)
     }
 }

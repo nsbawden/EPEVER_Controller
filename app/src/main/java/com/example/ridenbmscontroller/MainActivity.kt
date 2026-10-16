@@ -292,6 +292,11 @@ class MainActivity : ComponentActivity() {
                             applyControllerKeepAlive(it.controllerEnabled)
                             updateSocDrift()
                             updateLowSocAlarm()
+                            val holdSetpointChanged =
+                                kotlin.math.abs(it.bmsVoltageHoldVolts - previous.bmsVoltageHoldVolts) >= 0.005 ||
+                                    kotlin.math.abs(it.fullHoldVolts - previous.fullHoldVolts) >= 0.005 ||
+                                    kotlin.math.abs(it.maxBatteryVolts - previous.maxBatteryVolts) >= 0.005
+                            if (holdSetpointChanged) mpptController.invalidateVoltageWrite()
                             tickController()
                         }
                     },
@@ -320,6 +325,8 @@ class MainActivity : ComponentActivity() {
                             tickController()
                         }
                     },
+                    onEpeverVoltageCalChanged = { updateEpeverVoltageCal(it) },
+                    onToggleMpptCalDisplay = { toggleMpptCalDisplay() },
                     onClearEpeverEnergy = { clearEpeverGeneratedEnergy() },
                     onResetSocDrift = { resetSocDriftManual() },
                     onDeleteOpsLogsBeforeDate = { cutoff -> deleteOpsLogsBeforeDate(cutoff) },
@@ -378,7 +385,13 @@ class MainActivity : ComponentActivity() {
         if (connected) {
             if (!hadGoodEpeverConnection) {
                 addControllerEvent("EPEVER USB connected")
-                if (appSettings.unattendedMode && !chargeOutputHeldOff) writeUnattendedProfile(chargeOn = true)
+                if (!chargeOutputHeldOff) {
+                    if (appSettings.unattendedMode) {
+                        writeUnattendedProfile(chargeOn = true)
+                    } else {
+                        writeLiveLineImpedanceZero()
+                    }
+                }
             }
             hadGoodEpeverConnection = true
             stopUsbAlarm()
@@ -820,6 +833,8 @@ class MainActivity : ComponentActivity() {
             controllerEnabled = prefs.getBoolean(KEY_CONTROLLER_ENABLED, true),
             normalSocCeilingPercent = prefs.getInt(KEY_NORMAL_SOC_CEILING_PERCENT, defaults.normalSocCeilingPercent).coerceIn(50, 100),
             normalSocResumePercent = prefs.getInt(KEY_NORMAL_SOC_RESUME_PERCENT, defaults.normalSocResumePercent).coerceIn(50, 99),
+            holdSagVolts = prefs.getFloat(KEY_HOLD_SAG_V, defaults.holdSagVolts.toFloat()).toDouble().coerceIn(0.02, 0.50),
+            holdSagDwellS = prefs.getInt(KEY_HOLD_SAG_DWELL_S, defaults.holdSagDwellS).coerceIn(5, 600),
             lowSocAlarmPercent = prefs.getInt(KEY_LOW_SOC_ALARM_PERCENT, defaults.lowSocAlarmPercent),
             socDriftDeadbandAmps = prefs.getFloat(KEY_SOC_DRIFT_DEADBAND_A, defaults.socDriftDeadbandAmps.toFloat()).toDouble().coerceIn(0.0, 5.0),
             socDriftAlarmPercent = prefs.getInt(KEY_SOC_DRIFT_ALARM_PERCENT, defaults.socDriftAlarmPercent).coerceIn(0, 100),
@@ -833,7 +848,9 @@ class MainActivity : ComponentActivity() {
             logHistoryEnabled = prefs.getBoolean(KEY_LOG_HISTORY_ENABLED, defaults.logHistoryEnabled),
             unattendedMode = prefs.getBoolean(KEY_UNATTENDED_MODE, defaults.unattendedMode),
             manualCvEnabled = prefs.getBoolean(KEY_MANUAL_CV_ENABLED, defaults.manualCvEnabled),
-            manualCvVolts = prefs.getFloat(KEY_MANUAL_CV_V, defaults.manualCvVolts.toFloat()).toDouble()
+            manualCvVolts = prefs.getFloat(KEY_MANUAL_CV_V, defaults.manualCvVolts.toFloat()).toDouble(),
+            epeverVoltageCal = prefs.getFloat(KEY_EPEVER_V_CAL, defaults.epeverVoltageCal.toFloat()).toDouble().coerceIn(-0.50, 0.50),
+            showMpptCalVolts = prefs.getBoolean(KEY_SHOW_MPPT_CAL_V, defaults.showMpptCalVolts)
         )
     }
 
@@ -847,6 +864,8 @@ class MainActivity : ComponentActivity() {
             putBoolean(KEY_CONTROLLER_ENABLED, settings.controllerEnabled)
             putInt(KEY_NORMAL_SOC_CEILING_PERCENT, settings.normalSocCeilingPercent)
             putInt(KEY_NORMAL_SOC_RESUME_PERCENT, settings.normalSocResumePercent)
+            putFloat(KEY_HOLD_SAG_V, settings.holdSagVolts.toFloat())
+            putInt(KEY_HOLD_SAG_DWELL_S, settings.holdSagDwellS)
             putInt(KEY_LOW_SOC_ALARM_PERCENT, settings.lowSocAlarmPercent)
             putFloat(KEY_SOC_DRIFT_DEADBAND_A, settings.socDriftDeadbandAmps.toFloat())
             putInt(KEY_SOC_DRIFT_ALARM_PERCENT, settings.socDriftAlarmPercent)
@@ -861,6 +880,8 @@ class MainActivity : ComponentActivity() {
             putBoolean(KEY_UNATTENDED_MODE, settings.unattendedMode)
             putBoolean(KEY_MANUAL_CV_ENABLED, settings.manualCvEnabled)
             putFloat(KEY_MANUAL_CV_V, settings.manualCvVolts.toFloat())
+            putFloat(KEY_EPEVER_V_CAL, settings.epeverVoltageCal.toFloat())
+            putBoolean(KEY_SHOW_MPPT_CAL_V, settings.showMpptCalVolts)
         }
     }
 
@@ -970,15 +991,20 @@ class MainActivity : ComponentActivity() {
         batteryProfileStatus = "Reading EPEVER..."
         epeverUsbMonitor.readBatteryProfile { result ->
             result.onSuccess { device ->
-                unattendedProfile = if (appSettings.unattendedMode) {
-                    device
-                } else {
-                    unattendedProfile.mergeKeepingLiveOverlay(device)
+                unattendedProfile = when {
+                    kotlin.math.abs(appSettings.epeverVoltageCal) >= 0.0005 ->
+                        unattendedProfile.mergeKeepingVoltageSetpoints(device)
+                    appSettings.unattendedMode -> device
+                    else -> unattendedProfile.mergeKeepingLiveOverlay(device)
                 }
                 saveUnattendedProfile(unattendedProfile)
-                epeverUsbState.extendedSettings?.let {
-                    extendedSettings = it
-                    saveExtendedSettings(it)
+                epeverUsbState.extendedSettings?.let { device ->
+                    extendedSettings = if (appSettings.unattendedMode) {
+                        device
+                    } else {
+                        device.copy(lineImpedanceMOhm = extendedSettings.lineImpedanceMOhm)
+                    }
+                    saveExtendedSettings(extendedSettings)
                 }
                 batteryProfileStatus = "Read from EPEVER"
             }.onFailure { error ->
@@ -1046,6 +1072,23 @@ class MainActivity : ComponentActivity() {
         tickController()
     }
 
+    private fun updateEpeverVoltageCal(cal: Double) {
+        val next = appSettings.copy(epeverVoltageCal = cal.coerceIn(-0.50, 0.50))
+        if (next == appSettings) return
+        appSettings = next
+        saveSettings(next)
+        addControllerEvent("EPEVER voltage cal %+.2f V".format(next.epeverVoltageCal))
+        if (!chargeOutputHeldOff && next.unattendedMode) {
+            writeUnattendedProfile(chargeOn = false)
+        }
+    }
+
+    private fun toggleMpptCalDisplay() {
+        val next = appSettings.copy(showMpptCalVolts = !appSettings.showMpptCalVolts)
+        appSettings = next
+        saveSettings(next)
+    }
+
     private fun setUnattendedMode(unattended: Boolean) {
         if (appSettings.unattendedMode == unattended) return
         appSettings = appSettings.copy(unattendedMode = unattended)
@@ -1056,6 +1099,7 @@ class MainActivity : ComponentActivity() {
         } else {
             addControllerEvent("Live mode")
             batteryProfileStatus = "Live control resumed"
+            if (!chargeOutputHeldOff) writeLiveLineImpedanceZero()
         }
         tickController()
     }
@@ -1070,10 +1114,19 @@ class MainActivity : ComponentActivity() {
             return
         }
         batteryProfileStatus = "Writing unattended profile..."
-        epeverUsbMonitor.writeBatteryProfile(unattendedProfile) { result ->
+        val profile = if (appSettings.unattendedMode) {
+            unattendedProfile.withVoltageCal(appSettings.epeverVoltageCal)
+        } else {
+            unattendedProfile
+        }
+        epeverUsbMonitor.writeBatteryProfile(profile) { result ->
             result.onSuccess {
                 if (chargeOn) epeverUsbMonitor.setCharging(true)
-                writeExtendedSettings(extendedSettings, "Unattended profile written")
+                writeExtendedSettings(
+                    extendedSettings,
+                    "Unattended profile written",
+                    lineImpedanceOverride = null
+                )
                 addControllerEvent("EPEVER unattended profile written")
             }.onFailure { error ->
                 batteryProfileStatus = "Write failed: ${error.message ?: error.javaClass.simpleName}"
@@ -1091,9 +1144,26 @@ class MainActivity : ComponentActivity() {
         writeExtendedSettings(settings, "Extended settings written")
     }
 
-    private fun writeExtendedSettings(settings: EpeverExtendedSettings, successStatus: String) {
+    private fun writeLiveLineImpedanceZero() {
+        writeExtendedSettings(
+            extendedSettings,
+            "Live line impedance 0",
+            lineImpedanceOverride = 0.0
+        )
+    }
+
+    private fun writeExtendedSettings(
+        settings: EpeverExtendedSettings,
+        successStatus: String,
+        lineImpedanceOverride: Double? = if (appSettings.unattendedMode) null else 0.0
+    ) {
         if (!epeverUsbState.connected) return
-        epeverUsbMonitor.writeExtendedSettings(settings) { result ->
+        val toWrite = if (lineImpedanceOverride == null) {
+            settings
+        } else {
+            settings.copy(lineImpedanceMOhm = lineImpedanceOverride)
+        }
+        epeverUsbMonitor.writeExtendedSettings(toWrite) { result ->
             result.onSuccess {
                 batteryProfileStatus = successStatus
             }.onFailure { error ->
@@ -1568,6 +1638,8 @@ class MainActivity : ComponentActivity() {
         private const val KEY_UNATTENDED_MODE = "unattended_mode"
         private const val KEY_MANUAL_CV_ENABLED = "manual_cv_enabled"
         private const val KEY_MANUAL_CV_V = "manual_cv_v"
+        private const val KEY_EPEVER_V_CAL = "epever_voltage_cal"
+        private const val KEY_SHOW_MPPT_CAL_V = "show_mppt_cal_v"
         private const val KEY_BP_TYPE = "bp_type"
         private const val KEY_BP_CAPACITY = "bp_capacity"
         private const val KEY_BP_TEMP = "bp_temp"
@@ -1601,6 +1673,8 @@ class MainActivity : ComponentActivity() {
         private const val KEY_MAX_SOC_TRICKLE_A = "max_soc_trickle_a"
         private const val KEY_NORMAL_SOC_CEILING_PERCENT = "normal_soc_ceiling_percent"
         private const val KEY_NORMAL_SOC_RESUME_PERCENT = "normal_soc_resume_percent"
+        private const val KEY_HOLD_SAG_V = "hold_sag_v"
+        private const val KEY_HOLD_SAG_DWELL_S = "hold_sag_dwell_s"
         private const val KEY_SOC_HOLD_CURRENT_A = "soc_hold_current_a"
         private const val KEY_LOW_SOC_ALARM_PERCENT = "low_soc_alarm_percent"
         private const val KEY_SOC_DRIFT_DEADBAND_A = "soc_drift_deadband_a"
@@ -1809,6 +1883,8 @@ private fun EpeverApp(
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
     onManualCvChanged: (Boolean, Double) -> Unit,
+    onEpeverVoltageCalChanged: (Double) -> Unit,
+    onToggleMpptCalDisplay: () -> Unit,
     onClearEpeverEnergy: () -> Unit,
     onResetSocDrift: () -> Unit,
     onDeleteOpsLogsBeforeDate: (String) -> String,
@@ -1918,6 +1994,7 @@ private fun EpeverApp(
                         onPressureTileClick = onPressureTileClick,
                         onToggleBalanceToday = onToggleBalanceToday,
                         onManualCvChanged = onManualCvChanged,
+                        onToggleMpptCalDisplay = onToggleMpptCalDisplay,
                         modifier = Modifier.padding(
                             start = innerPadding.calculateStartPadding(layoutDirection),
                             end = innerPadding.calculateEndPadding(layoutDirection),
@@ -1961,6 +2038,8 @@ private fun EpeverApp(
                     epeverConnected = epeverUsbState.connected,
                     epeverClock = epeverUsbState.clock,
                     mppt = state.mppt,
+                    bmsVolts = state.battery.volts,
+                    bmsAmps = state.battery.amps,
                     status = batteryProfileStatus,
                     modifier = Modifier.padding(innerPadding),
                     onRefreshFromEpever = onRefreshBatteryProfile,
@@ -1969,6 +2048,8 @@ private fun EpeverApp(
                     onChargeOutputChanged = onChargeOutputChanged,
                     onProfileChanged = onBatteryProfileChanged,
                     onExtendedChanged = onExtendedSettingsChanged,
+                    voltageCal = appSettings.epeverVoltageCal,
+                    onVoltageCalChanged = onEpeverVoltageCalChanged,
                     onSyncClockFromPhone = onSyncEpeverClock,
                     onClearGeneratedEnergy = onClearEpeverEnergy
                 )
@@ -2042,6 +2123,7 @@ private fun AppState.withEpeverTelemetry(usbState: EpeverUsbState): AppState {
         mppt = live,
         controller = controller.copy(
             epeverConnected = usbState.connected,
+            lastEepromWriteMs = usbState.lastEepromWriteMs,
             status = listOf(
                 if (controller.bmsConnected) "BMS live" else "BMS disconnected",
                 usbState.status

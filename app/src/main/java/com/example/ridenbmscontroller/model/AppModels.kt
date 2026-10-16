@@ -89,7 +89,8 @@ data class ControllerState(
     val chargingOn: Boolean = false,
     val averagePackCurrentA: Double? = null,
     val profileBoostVolts: Double = 14.20,
-    val profileFloatVolts: Double = 13.60
+    val profileFloatVolts: Double = 13.60,
+    val lastEepromWriteMs: Long = 0L
 )
 
 data class AlertState(
@@ -117,7 +118,9 @@ data class AppSettings(
     val lastBalanceEpochDay: Long,
     val controllerEnabled: Boolean,
     val normalSocCeilingPercent: Int,
-    val normalSocResumePercent: Int,
+    val normalSocResumePercent: Int = 93,
+    val holdSagVolts: Double = 0.05,
+    val holdSagDwellS: Int = 120,
     val lowSocAlarmPercent: Int,
     val socDriftDeadbandAmps: Double,
     val socDriftAlarmPercent: Int,
@@ -131,7 +134,11 @@ data class AppSettings(
     val logHistoryEnabled: Boolean = true,
     val unattendedMode: Boolean = false,
     val manualCvEnabled: Boolean = false,
-    val manualCvVolts: Double = 13.42
+    val manualCvVolts: Double = 13.43,
+    /** Positive = MPPT reads high. Added only to Unattended profile writes. */
+    val epeverVoltageCal: Double = 0.0,
+    /** Dashboard tile: true shows raw MPPT V minus [epeverVoltageCal] as CAL V. */
+    val showMpptCalVolts: Boolean = false
 )
 
 data class HistoryPoint(
@@ -219,10 +226,12 @@ data class AppState(
                 controllerEnabled = true,
                 normalSocCeilingPercent = 95,
                 normalSocResumePercent = 93,
+                holdSagVolts = 0.05,
+                holdSagDwellS = 120,
                 lowSocAlarmPercent = 20,
                 socDriftDeadbandAmps = 1.5,
                 socDriftAlarmPercent = 20,
-                bmsVoltageHoldVolts = 13.42,
+                bmsVoltageHoldVolts = 13.43,
                 fullHoldVolts = 14.00,
                 controllerLoopMs = 400,
                 voltageWritePeriodS = 5,

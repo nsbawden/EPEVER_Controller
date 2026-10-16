@@ -73,6 +73,7 @@ class EpeverUsbMonitor(
     private val ioMutex = Mutex()
     private var parkedProfile: EpeverBatteryProfile? = null
     private var lastTelemetry = EpeverTelemetry()
+    private var lastEepromWriteMs = 0L
 
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -230,9 +231,12 @@ class EpeverUsbMonitor(
         }
     }
 
-    /** Tools-only inhibit: full 15-register park at [PARK_CHARGE_VOLTS]. Do not call from Live. */
-    fun parkChargeOutput(onDone: (Result<EpeverBatteryProfile>) -> Unit = {}) {
-        applyParkedVoltages(PARK_CHARGE_VOLTS, saveCurrent = true, onDone)
+    /** Tools-only inhibit: full 15-register park at [parkVolts]. Do not call from Live. */
+    fun parkChargeOutput(
+        parkVolts: Double = PARK_CHARGE_VOLTS,
+        onDone: (Result<EpeverBatteryProfile>) -> Unit = {}
+    ) {
+        applyParkedVoltages(parkVolts, saveCurrent = true, onDone)
     }
 
     fun restoreParkedChargeOutput(onDone: (Result<EpeverBatteryProfile>) -> Unit = {}) {
@@ -536,6 +540,7 @@ class EpeverUsbMonitor(
     /** Always the full 15-register FC10. Never FC06 or a short slice of 0x9000–0x900E. */
     private suspend fun writeBatteryProfile(io: ModbusIo, profile: EpeverBatteryProfile) {
         io.writeHoldingRegs(SLAVE_ID, REG_BATTERY_TYPE, profile.toRegisterBlock())
+        markEepromWrite()
     }
 
     /**
@@ -642,6 +647,7 @@ class EpeverUsbMonitor(
         if (required.isNotEmpty()) {
             error("Extended write failed: ${required.joinToString()}")
         }
+        markEepromWrite()
     }
 
     private suspend fun readTelemetry(io: ModbusIo, includeRated: Boolean = false): EpeverTelemetry {
@@ -763,9 +769,13 @@ class EpeverUsbMonitor(
         withContext(Dispatchers.Main) { publish(next) }
     }
 
+    private fun markEepromWrite() {
+        lastEepromWriteMs = System.currentTimeMillis()
+    }
+
     private fun publish(next: EpeverUsbState) {
-        state = next
-        onStateChanged(next)
+        state = next.copy(lastEepromWriteMs = lastEepromWriteMs)
+        onStateChanged(state)
     }
 
     private fun closeQuietly(port: UsbSerialPort?, connection: UsbDeviceConnection?) {
@@ -780,7 +790,7 @@ class EpeverUsbMonitor(
         /** Documented on BN/AN; AN firmware does not honor it for charge output. */
         private const val COIL_CHARGING = 0x0000
         private const val COIL_CLEAR_GENERATED_ENERGY = 0x0014
-        private const val PARK_CHARGE_VOLTS = 13.00
+        const val PARK_CHARGE_VOLTS = 13.00
         /** 0x3104 in this block is measured battery V (dashboard MPPT V). */
         private const val REG_REALTIME = 0x3100
         private const val REG_RATED = 0x3000
