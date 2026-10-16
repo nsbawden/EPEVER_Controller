@@ -1,6 +1,7 @@
 package com.example.ridenbmscontroller.controller
 
 import com.example.ridenbmscontroller.ble.BmsBleUiState
+import com.example.ridenbmscontroller.epever.EpeverBatteryProfile
 import com.example.ridenbmscontroller.epever.EpeverUsbState
 import com.example.ridenbmscontroller.epever.EpeverVoltageProfile
 import com.example.ridenbmscontroller.model.AppSettings
@@ -29,9 +30,15 @@ data class MpptControlState(
  * Do not park from this loop (Tools Off only). Offset EMA is display-only; never
  * add it to commanded CV (that held CV high vs BMS).
  *
- * Hold walks from device readback, never below BMS volts, 5 s / 0.10 V in sun.
+ * Live walks from device readback toward the policy CV (Bulk ceiling or Hold),
+ * 5 s / 0.10 V in sun. There is no 12.40 / BMS floor — current limiting must
+ * be able to sit at or below pack voltage. If BMS charge current exceeds
+ * [AppSettings.maxChargeAmps], the target becomes BMS volts (then steps below
+ * if still over). 0 A disables the limiter. Manual CV is not current-limited.
  * BMS lost while holding: leave the last CV. BMS gone 10 s and not in Hold:
  * No BMS (Tools profile once, then monitor). No invented offline-max write.
+ * Manual CV replaces the live Bulk/Hold number at write time only — not Unattended,
+ * No BMS, or Tools park.
  */
 class SolarMpptController(
     private val setCharging: (Boolean) -> Unit,
@@ -60,16 +67,31 @@ class SolarMpptController(
     private var lastHoldWriteMs = 0L
     private var alarmLatched = false
     private var bmsMissingSinceMs = 0L
+    private var lastManualEnabled = false
+    private var lastManualVolts = Double.NaN
 
     fun tick(
         settings: AppSettings,
         bmsState: BmsBleUiState,
         epeverState: EpeverUsbState,
-        outputHeldOff: Boolean = false
+        outputHeldOff: Boolean = false,
+        toolsProfile: EpeverBatteryProfile? = null
     ) {
         val now = System.currentTimeMillis()
-        if (now - lastTickMs < settings.controllerLoopMs.toLong()) return
+        val due = now - lastTickMs >= settings.controllerLoopMs.toLong()
+        val manualPoke = settings.manualCvEnabled != lastManualEnabled ||
+            (settings.manualCvEnabled &&
+                (lastManualVolts.isNaN() || abs(settings.manualCvVolts - lastManualVolts) >= 0.01))
+        if (!due && !manualPoke) return
         lastTickMs = now
+        if (manualPoke) {
+            lastWriteMs = 0L
+            lastHoldWriteMs = 0L
+            lastWrittenCv = Double.NaN
+            holdCv = Double.NaN
+        }
+        lastManualEnabled = settings.manualCvEnabled
+        lastManualVolts = settings.manualCvVolts
 
         val bms = bmsState.telemetry
         val epever = epeverState.telemetry
@@ -178,7 +200,7 @@ class SolarMpptController(
         }
 
         val bulkCeiling = settings.maxBatteryVolts
-        val lowVoltageReconnect = epeverState.deviceProfile?.lowVoltageReconnect ?: 12.60
+        val protection = toolsProfile ?: epeverState.deviceProfile
         updateOffset(epever.batteryVolts, batteryVolts)
 
         val soc = socPercent
@@ -209,18 +231,31 @@ class SolarMpptController(
         }
 
         if (wantHold) {
-            val overshoot = batteryVolts != null && batteryVolts >= holdVolts + OVERSHOOT_MARGIN_V
-            val cv = servoHoldCv(
-                holdVolts = holdVolts,
-                batteryVolts = batteryVolts,
-                mpptVolts = epever.batteryVolts,
-                harvestAmps = max(epever.chargeAmps, (bms.packCurrent ?: 0.0).coerceAtLeast(0.0)),
-                deviceCv = epeverState.deviceProfile?.regulationVolts,
-                bulkCeiling = bulkCeiling,
-                lowVoltageReconnect = lowVoltageReconnect,
-                now = now
-            )
             commandCharging(true)
+            val overshoot = batteryVolts != null && batteryVolts >= holdVolts + OVERSHOOT_MARGIN_V
+            val chargeAmps = (bms.packCurrent ?: 0.0).coerceAtLeast(0.0)
+            val cv = if (settings.manualCvEnabled) {
+                val manual = manualCv(settings)
+                maybeWriteProfile(
+                    EpeverVoltageProfile.regulation(manual, 15.0, protection),
+                    manual,
+                    now
+                )
+                manual
+            } else {
+                servoRegulationCv(
+                    policyCv = holdVolts,
+                    batteryVolts = batteryVolts,
+                    chargeAmps = chargeAmps,
+                    iMax = settings.maxChargeAmps,
+                    harvestAmps = max(epever.chargeAmps, chargeAmps),
+                    deviceCv = epeverState.deviceProfile?.regulationVolts,
+                    bulkCeiling = bulkCeiling,
+                    protection = protection,
+                    periodMs = settings.voltageWritePeriodS,
+                    now = now
+                )
+            }
             if (!holdEstSyncedThisVisit && reachedSoc) {
                 holdEstSyncedThisVisit = true
                 onEvent("Hold: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, CV ${"%.2f".format(cv)}V")
@@ -234,11 +269,17 @@ class SolarMpptController(
             publish(
                 settings = settings,
                 mode = if (belowHold && !overshoot) MODE_TOPUP else MODE_HOLD,
-                status = when {
-                    overshoot -> "Hold overshoot: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, lowering CV"
-                    belowHold -> "Top-up: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V to ${"%.2f".format(holdVolts)}V (CV ${"%.2f".format(cv)}V)"
-                    else -> "Holding BMS ${"%.2f".format(holdVolts)}V (CV ${"%.2f".format(cv)}V)"
-                },
+                status = liveStatus(
+                    modeLabel = if (belowHold && !overshoot) "Top-up" else "Hold",
+                    manual = settings.manualCvEnabled,
+                    cv = cv,
+                    policyCv = holdVolts,
+                    chargeAmps = chargeAmps,
+                    iMax = settings.maxChargeAmps,
+                    batteryVolts = batteryVolts,
+                    overshoot = overshoot,
+                    belowHold = belowHold
+                ),
                 commandCv = cv,
                 holdVolts = holdVolts,
                 socTarget = socTarget,
@@ -270,23 +311,52 @@ class SolarMpptController(
 
         commandCharging(true)
 
+        val chargeAmps = (bms.packCurrent ?: 0.0).coerceAtLeast(0.0)
+        val sendCv = if (settings.manualCvEnabled) {
+            manualCv(settings)
+        } else {
+            servoRegulationCv(
+                policyCv = bulkCeiling,
+                batteryVolts = batteryVolts,
+                chargeAmps = chargeAmps,
+                iMax = settings.maxChargeAmps,
+                harvestAmps = max(epever.chargeAmps, chargeAmps),
+                deviceCv = epeverState.deviceProfile?.regulationVolts,
+                bulkCeiling = bulkCeiling,
+                protection = protection,
+                periodMs = settings.voltageWritePeriodS,
+                now = now
+            )
+        }
         if (wasInHold) {
-            onEvent("Hold exit: resume bulk at ${"%.2f".format(bulkCeiling)}V")
+            onEvent("Hold exit: resume bulk toward ${"%.2f".format(bulkCeiling)}V")
             lastWriteMs = 0L
         }
         wasInHold = false
         holdEstSyncedThisVisit = false
-        clearHoldServo()
-        maybeWriteProfile(
-            EpeverVoltageProfile.bulk(bulkCeiling, lowVoltageReconnect),
-            bulkCeiling,
-            now
-        )
+        if (settings.manualCvEnabled) {
+            maybeWriteProfile(
+                EpeverVoltageProfile.regulation(sendCv, 15.0, protection),
+                sendCv,
+                now
+            )
+        }
         publish(
             settings = settings,
             mode = MODE_BULK,
-            status = "Bulk charge to SOC $socTarget%",
-            commandCv = bulkCeiling,
+            status = liveStatus(
+                modeLabel = "Bulk",
+                manual = settings.manualCvEnabled,
+                cv = sendCv,
+                policyCv = bulkCeiling,
+                chargeAmps = chargeAmps,
+                iMax = settings.maxChargeAmps,
+                batteryVolts = batteryVolts,
+                overshoot = false,
+                belowHold = false,
+                socTarget = socTarget
+            ),
+            commandCv = sendCv,
             holdVolts = holdVolts,
             socTarget = socTarget,
             chargingOn = true,
@@ -294,6 +364,8 @@ class SolarMpptController(
             bmsConnected = true
         )
     }
+
+    private fun manualCv(settings: AppSettings): Double = settings.manualCvVolts
 
     /** Display tile ΔV only. Do not feed this into hold/bulk CV. */
     private fun updateOffset(mpptVolts: Double, bmsVolts: Double?) {
@@ -314,81 +386,132 @@ class SolarMpptController(
         lastHoldWriteMs = 0L
     }
 
-    /** Never command a Hold CV below the last BMS pack volts. */
-    private fun holdFloorV(batteryVolts: Double?): Double {
-        return if (batteryVolts != null && batteryVolts > 0.0) max(12.40, batteryVolts) else 12.40
+    private fun sunStep(harvestAmps: Double): Double = when {
+        harvestAmps >= 8.0 -> HOLD_SUN_STEP_V
+        harvestAmps >= 3.0 -> 0.06
+        else -> 0.03
     }
 
-    private fun clampHoldCv(cv: Double, batteryVolts: Double?, hi: Double): Double {
-        return cv.coerceIn(holdFloorV(batteryVolts), hi)
-    }
-
-    /** Step toward [holdVolts] from the device readback, not from an offset-adjusted guess. */
-    private fun servoHoldCv(
-        holdVolts: Double,
+    /**
+     * Walk toward policy CV, or toward/below BMS volts when charge current is over
+     * [iMax]. No BMS / 12.40 floor — the limiter may sit under pack voltage.
+     */
+    private fun servoRegulationCv(
+        policyCv: Double,
         batteryVolts: Double?,
-        mpptVolts: Double,
+        chargeAmps: Double,
+        iMax: Double,
         harvestAmps: Double,
         deviceCv: Double?,
         bulkCeiling: Double,
-        lowVoltageReconnect: Double,
+        protection: EpeverBatteryProfile?,
+        periodMs: Int,
         now: Long
     ): Double {
-        val hi = bulkCeiling.coerceIn(12.40, 15.0)
-        val target = clampHoldCv(holdVolts, batteryVolts, hi)
+        val hi = bulkCeiling.coerceIn(EpeverVoltageProfile.MIN_LIVE_CV, 15.0)
+        val policy = policyCv.coerceIn(EpeverVoltageProfile.MIN_LIVE_CV, hi)
         val first = holdCv.isNaN()
         val from = when {
             deviceCv != null && deviceCv > 0.0 -> deviceCv
             !lastWrittenCv.isNaN() -> lastWrittenCv
             !holdCv.isNaN() -> holdCv
-            else -> target
+            else -> policy
         }
+        val limiterOn = iMax > 0.0
+        val over = limiterOn && chargeAmps >= iMax
+        val under = !limiterOn || chargeAmps <= iMax - CURRENT_LIMIT_HYST_A
+        val step = sunStep(harvestAmps)
+        val target = when {
+            over && batteryVolts != null && batteryVolts > 0.0 && from <= batteryVolts + 0.03 ->
+                (from - step).coerceAtLeast(EpeverVoltageProfile.MIN_LIVE_CV)
+            over && batteryVolts != null && batteryVolts > 0.0 ->
+                minOf(policy, batteryVolts)
+            over ->
+                (from - step).coerceAtLeast(EpeverVoltageProfile.MIN_LIVE_CV)
+            under ->
+                policy
+            else ->
+                holdCv.takeUnless { it.isNaN() } ?: from
+        }.coerceIn(EpeverVoltageProfile.MIN_LIVE_CV, hi)
+
         val gap = from - target
+        val bulkPolicy = abs(policy - hi) < 0.02
         val next = when {
             abs(gap) < HOLD_WRITE_EPS_V -> target
             gap > 0.15 -> target
-            gap > 0.0 -> {
-                val step = when {
-                    harvestAmps >= 8.0 -> HOLD_SUN_STEP_V
-                    harvestAmps >= 3.0 -> 0.06
-                    else -> 0.03
-                }
-                max(target, from - step)
-            }
-            else -> minOf(target, from + 0.05)
+            gap > 0.0 -> max(target, from - step)
+            !limiterOn && bulkPolicy -> target
+            else -> minOf(target, from + step)
         }
         holdCv = next
+        val servoPeriodMs = periodMs.coerceIn(1, 30) * 1000L
         if (!first && abs(from - target) < HOLD_WRITE_EPS_V) return target
-        if (!first && now - lastHoldWriteMs < HOLD_SERVO_PERIOD_MS) return holdCv
-        writeHoldCv(holdCv, batteryVolts, hi, lowVoltageReconnect, now)
+        if (!first && now - lastHoldWriteMs < servoPeriodMs) return holdCv
+        writeRegulationCv(holdCv, hi, protection, now)
         onEvent(
-            "Hold CV ${"%.2f".format(holdCv)}V from ${"%.2f".format(from)}V " +
-                "(BMS ${"%.2f".format(batteryVolts ?: 0.0)}V MPPT ${"%.2f".format(mpptVolts)}V " +
-                "${"%.1f".format(harvestAmps)}A)"
+            if (over) {
+                "Current limit CV ${"%.2f".format(holdCv)}V from ${"%.2f".format(from)}V " +
+                    "(BMS ${"%.2f".format(batteryVolts ?: 0.0)}V ${"%.1f".format(chargeAmps)}A > ${"%.0f".format(iMax)}A)"
+            } else {
+                "Live CV ${"%.2f".format(holdCv)}V from ${"%.2f".format(from)}V " +
+                    "(BMS ${"%.2f".format(batteryVolts ?: 0.0)}V ${"%.1f".format(chargeAmps)}A)"
+            }
         )
         return holdCv
     }
 
-    private fun writeHoldCv(
+    private fun writeRegulationCv(
         cv: Double,
-        batteryVolts: Double?,
         bulkCeiling: Double,
-        lowVoltageReconnect: Double,
+        protection: EpeverBatteryProfile?,
         now: Long
     ) {
-        val clamped = clampHoldCv(cv, batteryVolts, bulkCeiling)
+        val clamped = cv.coerceIn(EpeverVoltageProfile.MIN_LIVE_CV, bulkCeiling.coerceIn(EpeverVoltageProfile.MIN_LIVE_CV, 15.0))
         holdCv = clamped
         lastHoldWriteMs = now
         lastWriteMs = now
-        applyVoltageProfile(EpeverVoltageProfile.hold(clamped, bulkCeiling, lowVoltageReconnect)) { ok ->
+        applyVoltageProfile(EpeverVoltageProfile.regulation(clamped, bulkCeiling, protection)) { ok ->
             if (ok) {
                 lastWrittenCv = clamped
             } else {
-                lastHoldWriteMs = now - HOLD_SERVO_PERIOD_MS + HOLD_RETRY_MS
+                lastHoldWriteMs = now - 3_000L
                 lastWrittenCv = Double.NaN
-                onEvent("EPEVER hold CV ${"%.2f".format(clamped)}V write failed")
+                onEvent("EPEVER CV ${"%.2f".format(clamped)}V write failed")
             }
             if (lastCharging == false) setCharging(false)
+        }
+    }
+
+    private fun liveStatus(
+        modeLabel: String,
+        manual: Boolean,
+        cv: Double,
+        policyCv: Double,
+        chargeAmps: Double,
+        iMax: Double,
+        batteryVolts: Double?,
+        overshoot: Boolean,
+        belowHold: Boolean,
+        socTarget: Int? = null
+    ): String {
+        if (manual) return "Manual CV ${"%.2f".format(cv)}V"
+        val over = iMax > 0.0 && chargeAmps >= iMax
+        val limiting = iMax > 0.0 && cv < policyCv - 0.05
+        return when {
+            over ->
+                "$modeLabel current limit: ${"%.1f".format(chargeAmps)} A > ${"%.0f".format(iMax)} A, CV ${"%.2f".format(cv)}V"
+            limiting ->
+                "$modeLabel recovering from current limit, CV ${"%.2f".format(cv)}V"
+            overshoot ->
+                "Hold overshoot: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V, lowering CV"
+            belowHold ->
+                "Top-up: BMS ${"%.2f".format(batteryVolts ?: 0.0)}V to ${"%.2f".format(policyCv)}V (CV ${"%.2f".format(cv)}V)"
+            modeLabel == "Hold" ->
+                "Holding BMS ${"%.2f".format(policyCv)}V (CV ${"%.2f".format(cv)}V)"
+            socTarget != null ->
+                "Bulk charge to SOC $socTarget%"
+            else ->
+                "$modeLabel CV ${"%.2f".format(cv)}V"
         }
     }
 
@@ -550,10 +673,9 @@ class SolarMpptController(
         /** EEPROM: do not rewrite the 15-register block every tick. */
         private const val CV_WRITE_COOLDOWN_MS = 12_000L
         private const val OVERSHOOT_MARGIN_V = 0.15
-        private const val HOLD_SERVO_PERIOD_MS = 5_000L
-        private const val HOLD_RETRY_MS = 2_000L
         private const val HOLD_WRITE_EPS_V = 0.02
         private const val HOLD_SUN_STEP_V = 0.10
+        private const val CURRENT_LIMIT_HYST_A = 2.0
         private const val ALARM_BASE_HOLD_MS = 60_000L
         private const val ALARM_MAX_HOLD_MS = 1_800_000L
         private const val ALARM_REPEAT_WINDOW_MS = 600_000L

@@ -38,7 +38,19 @@ data class EpeverTelemetry(
     val maxPvVoltsToday: Double = 0.0,
     val minPvVoltsToday: Double = 0.0,
     val maxBatteryVoltsToday: Double = 0.0,
-    val minBatteryVoltsToday: Double = 0.0
+    val minBatteryVoltsToday: Double = 0.0,
+    val controllerSocPercent: Int? = null,
+    val systemRatedVolts: Double? = null,
+    val ratedPvVolts: Double? = null,
+    val ratedPvAmps: Double? = null,
+    val ratedPvWatts: Double? = null,
+    val ratedChargeVolts: Double? = null,
+    val ratedChargeAmps: Double? = null,
+    val ratedChargeWatts: Double? = null,
+    val batteryStatusText: String? = null,
+    val chargeStatusText: String? = null,
+    val netBatteryAmps: Double? = null,
+    val chargingModeText: String? = null
 )
 
 data class EpeverClock(
@@ -107,8 +119,49 @@ data class EpeverUsbState(
     val telemetrySampleSeq: Long = 0L,
     val clock: EpeverClock? = null,
     val deviceProfile: EpeverBatteryProfile? = null,
+    val extendedSettings: EpeverExtendedSettings? = null,
     val lastWriteNote: String? = null
 )
+
+/** Non-load settings outside the 0x9000–0x900E voltage block. */
+data class EpeverExtendedSettings(
+    val equalizeCycleDays: Int = 28,
+    val batteryTempWarnHighC: Double = 65.0,
+    val batteryTempWarnLowC: Double = -40.0,
+    val innerTempLimitC: Double = 85.0,
+    val innerTempRecoverC: Double = 75.0,
+    val powerTempLimitC: Double = 85.0,
+    val powerTempRecoverC: Double = 75.0,
+    val lineImpedanceMOhm: Double = 0.0,
+    val batteryRatedVoltageCode: Int = 0,
+    val equalizeDurationMin: Int = 0,
+    val boostDurationMin: Int = 120,
+    val dischargePercent: Int = 30,
+    val chargePercent: Int = 100,
+    val chargeManagementSoc: Boolean = false
+) {
+    val batteryRatedVoltageLabel: String
+        get() = batteryRatedVoltageLabel(batteryRatedVoltageCode)
+
+    val chargeManagementLabel: String
+        get() = if (chargeManagementSoc) "SOC" else "Voltage"
+
+    companion object {
+        fun batteryRatedVoltageLabel(code: Int): String = when (code) {
+            1 -> "12 V"
+            2 -> "24 V"
+            3 -> "36 V"
+            4 -> "48 V"
+            else -> "Auto"
+        }
+
+        fun nextRatedVoltageCode(code: Int): Int = when (code) {
+            0 -> 1
+            1 -> 2
+            else -> 0
+        }
+    }
+}
 
 /** 0x9000–0x900E. Custom voltages require type User (0) in this same 15-register write. */
 data class EpeverBatteryProfile(
@@ -160,7 +213,12 @@ data class EpeverBatteryProfile(
             equalizeVolts = profile.equalizeVolts,
             boostVolts = profile.boostVolts,
             floatVolts = profile.floatVolts,
-            boostReconnectVolts = profile.boostReconnectVolts
+            boostReconnectVolts = profile.boostReconnectVolts,
+            lowVoltageReconnect = profile.lowVoltageReconnect ?: lowVoltageReconnect,
+            underVoltageRecover = profile.underVoltageRecover ?: underVoltageRecover,
+            underVoltageWarning = profile.underVoltageWarning ?: underVoltageWarning,
+            lowVoltageDisconnect = profile.lowVoltageDisconnect ?: lowVoltageDisconnect,
+            dischargingLimitVolts = profile.dischargingLimitVolts ?: dischargingLimitVolts
         )
     }
 
@@ -184,35 +242,107 @@ data class EpeverVoltageProfile(
     val equalizeVolts: Double,
     val boostVolts: Double,
     val floatVolts: Double,
-    val boostReconnectVolts: Double
+    val boostReconnectVolts: Double,
+    val lowVoltageReconnect: Double? = null,
+    val underVoltageRecover: Double? = null,
+    val underVoltageWarning: Double? = null,
+    val lowVoltageDisconnect: Double? = null,
+    val dischargingLimitVolts: Double? = null
 ) {
     companion object {
+        const val MIN_LIVE_CV = 9.0
+
         fun bulk(maxBatteryVolts: Double, lowVoltageReconnect: Double = 12.60): EpeverVoltageProfile {
-            val cv = maxBatteryVolts.coerceIn(12.0, 15.0)
-            val lvr = lowVoltageReconnect.coerceIn(9.0, 14.0)
-            return EpeverVoltageProfile(
-                chargeLimitVolts = cv,
-                highVoltageDisconnect = (cv + 0.30).coerceAtMost(15.0),
-                overVoltageReconnect = cv,
-                equalizeVolts = cv,
-                boostVolts = cv,
-                floatVolts = cv,
-                boostReconnectVolts = (cv - 0.40).coerceAtLeast((lvr + 0.02).coerceAtMost(cv - 0.02))
-            )
+            return regulation(maxBatteryVolts, maxBatteryVolts, lowVoltageReconnect)
         }
 
         fun hold(holdCv: Double, maxBatteryVolts: Double, lowVoltageReconnect: Double = 12.60): EpeverVoltageProfile {
-            val cv = holdCv.coerceIn(12.40, maxBatteryVolts.coerceIn(12.40, 15.0))
-            val lvr = lowVoltageReconnect.coerceIn(9.0, 14.0)
+            return regulation(holdCv, maxBatteryVolts, lowVoltageReconnect)
+        }
+
+        /**
+         * Live CV with no 12.40 / BMS floor. If [cv] is below the saved LVR window,
+         * the overlay also drops LVR…DLV so boostReconnect stays legal. Tools
+         * protection values are restored automatically when CV rises again.
+         */
+        fun regulation(
+            cv: Double,
+            bulkCeiling: Double,
+            device: EpeverBatteryProfile?
+        ): EpeverVoltageProfile {
+            return regulation(
+                cv,
+                bulkCeiling,
+                device?.lowVoltageReconnect ?: 12.60,
+                device
+            )
+        }
+
+        fun regulation(
+            cv: Double,
+            bulkCeiling: Double,
+            lowVoltageReconnect: Double,
+            device: EpeverBatteryProfile? = null
+        ): EpeverVoltageProfile {
+            val hi = bulkCeiling.coerceIn(MIN_LIVE_CV, 15.0)
+            val command = cv.coerceIn(MIN_LIVE_CV, hi)
+            val deviceLvr = (device?.lowVoltageReconnect ?: lowVoltageReconnect).coerceIn(8.5, 14.0)
+            val lvr = minOf(deviceLvr, command - 0.22).coerceAtLeast(8.5)
+            val uvr = minOf(device?.underVoltageRecover ?: 12.20, lvr - 0.20).coerceAtLeast(8.3)
+            val uvw = minOf(device?.underVoltageWarning ?: 12.00, uvr - 0.20).coerceAtLeast(8.1)
+            val lvd = minOf(device?.lowVoltageDisconnect ?: 11.10, uvw - 0.20).coerceAtLeast(8.0)
+            val dlv = minOf(device?.dischargingLimitVolts ?: 11.00, lvd - 0.10).coerceAtLeast(7.9)
             return EpeverVoltageProfile(
-                chargeLimitVolts = cv,
-                highVoltageDisconnect = (cv + 0.30).coerceAtMost(15.0),
-                overVoltageReconnect = cv,
-                equalizeVolts = cv,
-                boostVolts = cv,
-                floatVolts = cv,
-                boostReconnectVolts = (cv - 0.20).coerceAtLeast((lvr + 0.02).coerceAtMost(cv - 0.02))
+                chargeLimitVolts = command,
+                highVoltageDisconnect = (command + 0.30).coerceAtMost(15.0),
+                overVoltageReconnect = command,
+                equalizeVolts = command,
+                boostVolts = command,
+                floatVolts = command,
+                boostReconnectVolts = (command - 0.20).coerceAtLeast(lvr + 0.02),
+                lowVoltageReconnect = lvr,
+                underVoltageRecover = uvr,
+                underVoltageWarning = uvw,
+                lowVoltageDisconnect = lvd,
+                dischargingLimitVolts = dlv
             )
         }
     }
+}
+
+fun decodeBatteryStatus(raw: Int): String {
+    val volt = when (raw and 0x0F) {
+        1 -> "Overvolt"
+        2 -> "Undervolt"
+        3 -> "LVD"
+        4 -> "Fault"
+        else -> "Normal"
+    }
+    val temp = when ((raw ushr 4) and 0x0F) {
+        1 -> "over-temp"
+        2 -> "low-temp"
+        else -> "temp OK"
+    }
+    val bits = buildList {
+        if ((raw and 0x0100) != 0) add("IR abnormal")
+        if ((raw and 0x8000) != 0) add("rated-V mismatch")
+    }
+    return if (bits.isEmpty()) "$volt, $temp" else "$volt, $temp, ${bits.joinToString()}"
+}
+
+fun decodeChargeStatusExtra(raw: Int): String {
+    val input = when ((raw ushr 14) and 0x03) {
+        1 -> "PV none"
+        2 -> "PV high"
+        3 -> "PV error"
+        else -> "PV OK"
+    }
+    val faults = buildList {
+        if ((raw and 0x2000) != 0) add("charge FET short")
+        if ((raw and 0x1000) != 0) add("charge/anti-rev short")
+        if ((raw and 0x0800) != 0) add("anti-rev short")
+        if ((raw and 0x0400) != 0) add("input overcurrent")
+        if ((raw and 0x0010) != 0) add("PV short")
+    }
+    return if (faults.isEmpty()) input else "$input, ${faults.joinToString()}"
 }

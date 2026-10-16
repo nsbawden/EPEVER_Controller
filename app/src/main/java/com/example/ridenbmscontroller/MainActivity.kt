@@ -72,6 +72,7 @@ import com.example.ridenbmscontroller.logging.OpsTelemetrySample
 import com.example.ridenbmscontroller.model.PowerDirection
 import com.example.ridenbmscontroller.model.MpptState
 import com.example.ridenbmscontroller.epever.EpeverBatteryProfile
+import com.example.ridenbmscontroller.epever.EpeverExtendedSettings
 import com.example.ridenbmscontroller.epever.EpeverUsbMonitor
 import com.example.ridenbmscontroller.epever.EpeverUsbState
 import com.example.ridenbmscontroller.ui.screens.DashboardScreen
@@ -104,6 +105,7 @@ class MainActivity : ComponentActivity() {
     private var epeverUsbState by mutableStateOf(EpeverUsbState())
     private var appSettings by mutableStateOf(AppState.preview.settings)
     private var unattendedProfile by mutableStateOf(EpeverBatteryProfile())
+    private var extendedSettings by mutableStateOf(EpeverExtendedSettings())
     private var batteryProfileStatus by mutableStateOf("Not read yet")
     private var chargeOutputHeldOff by mutableStateOf(false)
     private var mpptControlState by mutableStateOf(MpptControlState())
@@ -197,6 +199,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         appSettings = loadSettings()
         unattendedProfile = loadUnattendedProfile()
+        extendedSettings = loadExtendedSettings()
         opsLogger = OpsLogger(filesDir)
         refreshOpsLogSummary()
         if (appSettings.logEventsEnabled) {
@@ -302,17 +305,34 @@ class MainActivity : ComponentActivity() {
                     balanceDayToday = isBalanceDayToday(appSettings),
                     daysUntilNextBalance = daysUntilNextBalance(appSettings),
                     onToggleBalanceToday = { toggleBalanceToday() },
+                    onManualCvChanged = { enabled, volts ->
+                        val next = appSettings.copy(
+                            manualCvEnabled = enabled,
+                            manualCvVolts = volts
+                        )
+                        if (next != appSettings) {
+                            appSettings = next
+                            saveSettings(next)
+                            addControllerEvent(
+                                if (enabled) "Manual CV %.2f V".format(next.manualCvVolts)
+                                else "Manual CV off"
+                            )
+                            tickController()
+                        }
+                    },
                     onClearEpeverEnergy = { clearEpeverGeneratedEnergy() },
                     onResetSocDrift = { resetSocDriftManual() },
                     onDeleteOpsLogsBeforeDate = { cutoff -> deleteOpsLogsBeforeDate(cutoff) },
                     onRefreshOpsLogSummary = { refreshOpsLogSummary() },
                     unattendedProfile = unattendedProfile,
+                    extendedSettings = extendedSettings,
                     batteryProfileStatus = batteryProfileStatus,
                     onRefreshBatteryProfile = { refreshBatteryProfileFromEpever() },
                     onUnattendedModeChanged = { setUnattendedMode(it) },
                     chargeOutputOn = !chargeOutputHeldOff,
                     onChargeOutputChanged = { setChargeOutputOn(it) },
                     onBatteryProfileChanged = { profile, write -> updateBatteryProfile(profile, write) },
+                    onExtendedSettingsChanged = { settings -> updateExtendedSettings(settings) },
                     onSyncEpeverClock = { syncEpeverClockFromPhone() },
                     onDismissLogStorageWarning = {
                         logStorageWarningDismissed = true
@@ -349,7 +369,8 @@ class MainActivity : ComponentActivity() {
             appSettings,
             bmsBleState,
             epeverUsbState,
-            outputHeldOff = chargeOutputHeldOff
+            outputHeldOff = chargeOutputHeldOff,
+            toolsProfile = unattendedProfile
         )
     }
 
@@ -792,6 +813,7 @@ class MainActivity : ComponentActivity() {
         }
         return AppSettings(
             maxBatteryVolts = prefs.getFloat(KEY_MAX_BATTERY_V, defaults.maxBatteryVolts.toFloat()).toDouble(),
+            maxChargeAmps = prefs.getFloat(KEY_MAX_CHARGE_A, defaults.maxChargeAmps.toFloat()).toDouble().coerceIn(0.0, 80.0),
             bmsOfflineMaxBatteryVolts = prefs.getFloat(KEY_BMS_OFFLINE_MAX_BATTERY_V, defaults.bmsOfflineMaxBatteryVolts.toFloat()).toDouble(),
             balanceEveryDays = prefs.getInt(KEY_BALANCE_EVERY_DAYS, defaults.balanceEveryDays),
             lastBalanceEpochDay = prefs.getLong(KEY_LAST_BALANCE_EPOCH_DAY, defaults.lastBalanceEpochDay),
@@ -804,17 +826,21 @@ class MainActivity : ComponentActivity() {
             bmsVoltageHoldVolts = prefs.getFloat(KEY_BMS_VOLTAGE_HOLD_V, defaults.bmsVoltageHoldVolts.toFloat()).toDouble().coerceIn(12.0, 15.0),
             fullHoldVolts = prefs.getFloat(KEY_FULL_HOLD_V, defaults.fullHoldVolts.toFloat()).toDouble().coerceIn(12.0, 15.0),
             controllerLoopMs = prefs.getInt(KEY_CONTROLLER_LOOP_MS, defaults.controllerLoopMs),
+            voltageWritePeriodS = prefs.getInt(KEY_VOLTAGE_WRITE_S, defaults.voltageWritePeriodS).coerceIn(1, 30),
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, defaults.keepScreenOn),
             logEventsEnabled = prefs.getBoolean(KEY_LOG_EVENTS_ENABLED, defaults.logEventsEnabled),
             logTelemetryEnabled = prefs.getBoolean(KEY_LOG_TELEMETRY_ENABLED, defaults.logTelemetryEnabled),
             logHistoryEnabled = prefs.getBoolean(KEY_LOG_HISTORY_ENABLED, defaults.logHistoryEnabled),
-            unattendedMode = prefs.getBoolean(KEY_UNATTENDED_MODE, defaults.unattendedMode)
+            unattendedMode = prefs.getBoolean(KEY_UNATTENDED_MODE, defaults.unattendedMode),
+            manualCvEnabled = prefs.getBoolean(KEY_MANUAL_CV_ENABLED, defaults.manualCvEnabled),
+            manualCvVolts = prefs.getFloat(KEY_MANUAL_CV_V, defaults.manualCvVolts.toFloat()).toDouble()
         )
     }
 
     private fun saveSettings(settings: AppSettings) {
         getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit {
             putFloat(KEY_MAX_BATTERY_V, settings.maxBatteryVolts.toFloat())
+            putFloat(KEY_MAX_CHARGE_A, settings.maxChargeAmps.toFloat())
             putFloat(KEY_BMS_OFFLINE_MAX_BATTERY_V, settings.bmsOfflineMaxBatteryVolts.toFloat())
             putInt(KEY_BALANCE_EVERY_DAYS, settings.balanceEveryDays)
             putLong(KEY_LAST_BALANCE_EPOCH_DAY, settings.lastBalanceEpochDay)
@@ -827,11 +853,14 @@ class MainActivity : ComponentActivity() {
             putFloat(KEY_BMS_VOLTAGE_HOLD_V, settings.bmsVoltageHoldVolts.toFloat())
             putFloat(KEY_FULL_HOLD_V, settings.fullHoldVolts.toFloat())
             putInt(KEY_CONTROLLER_LOOP_MS, settings.controllerLoopMs)
+            putInt(KEY_VOLTAGE_WRITE_S, settings.voltageWritePeriodS)
             putBoolean(KEY_KEEP_SCREEN_ON, settings.keepScreenOn)
             putBoolean(KEY_LOG_EVENTS_ENABLED, settings.logEventsEnabled)
             putBoolean(KEY_LOG_TELEMETRY_ENABLED, settings.logTelemetryEnabled)
             putBoolean(KEY_LOG_HISTORY_ENABLED, settings.logHistoryEnabled)
             putBoolean(KEY_UNATTENDED_MODE, settings.unattendedMode)
+            putBoolean(KEY_MANUAL_CV_ENABLED, settings.manualCvEnabled)
+            putFloat(KEY_MANUAL_CV_V, settings.manualCvVolts.toFloat())
         }
     }
 
@@ -877,6 +906,46 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun loadExtendedSettings(): EpeverExtendedSettings {
+        val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+        val defaults = EpeverExtendedSettings()
+        return EpeverExtendedSettings(
+            equalizeCycleDays = prefs.getInt(KEY_EX_EQ_CYCLE, defaults.equalizeCycleDays),
+            batteryTempWarnHighC = prefs.getFloat(KEY_EX_BATT_T_HIGH, defaults.batteryTempWarnHighC.toFloat()).toDouble(),
+            batteryTempWarnLowC = prefs.getFloat(KEY_EX_BATT_T_LOW, defaults.batteryTempWarnLowC.toFloat()).toDouble(),
+            innerTempLimitC = prefs.getFloat(KEY_EX_INNER_T_LIM, defaults.innerTempLimitC.toFloat()).toDouble(),
+            innerTempRecoverC = prefs.getFloat(KEY_EX_INNER_T_REC, defaults.innerTempRecoverC.toFloat()).toDouble(),
+            powerTempLimitC = prefs.getFloat(KEY_EX_PWR_T_LIM, defaults.powerTempLimitC.toFloat()).toDouble(),
+            powerTempRecoverC = prefs.getFloat(KEY_EX_PWR_T_REC, defaults.powerTempRecoverC.toFloat()).toDouble(),
+            lineImpedanceMOhm = prefs.getFloat(KEY_EX_LINE_Z, defaults.lineImpedanceMOhm.toFloat()).toDouble(),
+            batteryRatedVoltageCode = prefs.getInt(KEY_EX_RATED_V, defaults.batteryRatedVoltageCode),
+            equalizeDurationMin = prefs.getInt(KEY_EX_EQ_MIN, defaults.equalizeDurationMin),
+            boostDurationMin = prefs.getInt(KEY_EX_BOOST_MIN, defaults.boostDurationMin),
+            dischargePercent = prefs.getInt(KEY_EX_DISCH_PCT, defaults.dischargePercent),
+            chargePercent = prefs.getInt(KEY_EX_CHG_PCT, defaults.chargePercent),
+            chargeManagementSoc = prefs.getBoolean(KEY_EX_MGMT_SOC, defaults.chargeManagementSoc)
+        )
+    }
+
+    private fun saveExtendedSettings(settings: EpeverExtendedSettings) {
+        getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit {
+            putInt(KEY_EX_EQ_CYCLE, settings.equalizeCycleDays)
+            putFloat(KEY_EX_BATT_T_HIGH, settings.batteryTempWarnHighC.toFloat())
+            putFloat(KEY_EX_BATT_T_LOW, settings.batteryTempWarnLowC.toFloat())
+            putFloat(KEY_EX_INNER_T_LIM, settings.innerTempLimitC.toFloat())
+            putFloat(KEY_EX_INNER_T_REC, settings.innerTempRecoverC.toFloat())
+            putFloat(KEY_EX_PWR_T_LIM, settings.powerTempLimitC.toFloat())
+            putFloat(KEY_EX_PWR_T_REC, settings.powerTempRecoverC.toFloat())
+            putFloat(KEY_EX_LINE_Z, settings.lineImpedanceMOhm.toFloat())
+            putInt(KEY_EX_RATED_V, settings.batteryRatedVoltageCode)
+            putInt(KEY_EX_EQ_MIN, settings.equalizeDurationMin)
+            putInt(KEY_EX_BOOST_MIN, settings.boostDurationMin)
+            putInt(KEY_EX_DISCH_PCT, settings.dischargePercent)
+            putInt(KEY_EX_CHG_PCT, settings.chargePercent)
+            putBoolean(KEY_EX_MGMT_SOC, settings.chargeManagementSoc)
+        }
+    }
+
     private fun syncEpeverClockFromPhone() {
         if (!epeverUsbState.connected) {
             batteryProfileStatus = "EPEVER disconnected"
@@ -907,6 +976,10 @@ class MainActivity : ComponentActivity() {
                     unattendedProfile.mergeKeepingLiveOverlay(device)
                 }
                 saveUnattendedProfile(unattendedProfile)
+                epeverUsbState.extendedSettings?.let {
+                    extendedSettings = it
+                    saveExtendedSettings(it)
+                }
                 batteryProfileStatus = "Read from EPEVER"
             }.onFailure { error ->
                 batteryProfileStatus = "Read failed: ${error.message ?: error.javaClass.simpleName}"
@@ -1000,10 +1073,31 @@ class MainActivity : ComponentActivity() {
         epeverUsbMonitor.writeBatteryProfile(unattendedProfile) { result ->
             result.onSuccess {
                 if (chargeOn) epeverUsbMonitor.setCharging(true)
-                batteryProfileStatus = "Unattended profile written"
+                writeExtendedSettings(extendedSettings, "Unattended profile written")
                 addControllerEvent("EPEVER unattended profile written")
             }.onFailure { error ->
                 batteryProfileStatus = "Write failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+        }
+    }
+
+    private fun updateExtendedSettings(settings: EpeverExtendedSettings) {
+        extendedSettings = settings
+        saveExtendedSettings(settings)
+        if (chargeOutputHeldOff) {
+            batteryProfileStatus = "Charge output off — extras saved, not written"
+            return
+        }
+        writeExtendedSettings(settings, "Extended settings written")
+    }
+
+    private fun writeExtendedSettings(settings: EpeverExtendedSettings, successStatus: String) {
+        if (!epeverUsbState.connected) return
+        epeverUsbMonitor.writeExtendedSettings(settings) { result ->
+            result.onSuccess {
+                batteryProfileStatus = successStatus
+            }.onFailure { error ->
+                batteryProfileStatus = "Extras write failed: ${error.message ?: error.javaClass.simpleName}"
             }
         }
     }
@@ -1030,7 +1124,7 @@ class MainActivity : ComponentActivity() {
         val wasBalanceDay = isBalanceDayToday(appSettings)
         val epochDay = if (wasBalanceDay) today - 1L else today
         markBalanceDayStarted(epochDay)
-        addControllerEvent(if (wasBalanceDay) "Balance day canceled" else "Balance day forced")
+        addControllerEvent(if (wasBalanceDay) "Top-off day canceled" else "Top-off day forced")
         tickController()
     }
 
@@ -1038,7 +1132,7 @@ class MainActivity : ComponentActivity() {
     private fun cancelBalanceDayAfterTopOff() {
         if (!isBalanceDayToday(appSettings)) return
         markBalanceDayStarted(currentEpochDay() - 1L)
-        addControllerEvent("Balance day canceled (top-off complete)")
+        addControllerEvent("Top-off day canceled (complete)")
         tickController()
     }
 
@@ -1472,6 +1566,8 @@ class MainActivity : ComponentActivity() {
         private const val KEY_CONTROLLER_ENABLED = "controller_enabled"
         private const val KEY_CONTROLLER_ON_MIGRATED = "controller_on_migrated"
         private const val KEY_UNATTENDED_MODE = "unattended_mode"
+        private const val KEY_MANUAL_CV_ENABLED = "manual_cv_enabled"
+        private const val KEY_MANUAL_CV_V = "manual_cv_v"
         private const val KEY_BP_TYPE = "bp_type"
         private const val KEY_BP_CAPACITY = "bp_capacity"
         private const val KEY_BP_TEMP = "bp_temp"
@@ -1487,6 +1583,20 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BP_UVW = "bp_uvw"
         private const val KEY_BP_LVD = "bp_lvd"
         private const val KEY_BP_DLV = "bp_dlv"
+        private const val KEY_EX_EQ_CYCLE = "ex_eq_cycle"
+        private const val KEY_EX_BATT_T_HIGH = "ex_batt_t_high"
+        private const val KEY_EX_BATT_T_LOW = "ex_batt_t_low"
+        private const val KEY_EX_INNER_T_LIM = "ex_inner_t_lim"
+        private const val KEY_EX_INNER_T_REC = "ex_inner_t_rec"
+        private const val KEY_EX_PWR_T_LIM = "ex_pwr_t_lim"
+        private const val KEY_EX_PWR_T_REC = "ex_pwr_t_rec"
+        private const val KEY_EX_LINE_Z = "ex_line_z"
+        private const val KEY_EX_RATED_V = "ex_rated_v"
+        private const val KEY_EX_EQ_MIN = "ex_eq_min"
+        private const val KEY_EX_BOOST_MIN = "ex_boost_min"
+        private const val KEY_EX_DISCH_PCT = "ex_disch_pct"
+        private const val KEY_EX_CHG_PCT = "ex_chg_pct"
+        private const val KEY_EX_MGMT_SOC = "ex_mgmt_soc"
         private const val KEY_MAX_CHARGE_PERCENT = "max_charge_percent"
         private const val KEY_MAX_SOC_TRICKLE_A = "max_soc_trickle_a"
         private const val KEY_NORMAL_SOC_CEILING_PERCENT = "normal_soc_ceiling_percent"
@@ -1514,6 +1624,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_FAST_ACQUIRE_SUCCESS_COUNT = "fast_acquire_success_count"
         private const val KEY_POWER_BASED_VTUNE_STOP = "power_based_vtune_stop"
         private const val KEY_CONTROLLER_LOOP_MS = "controller_loop_ms"
+        private const val KEY_VOLTAGE_WRITE_S = "voltage_write_s"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_LOG_EVENTS_ENABLED = "log_events_enabled"
         private const val KEY_LOG_TELEMETRY_ENABLED = "log_telemetry_enabled"
@@ -1697,17 +1808,20 @@ private fun EpeverApp(
     balanceDayToday: Boolean,
     daysUntilNextBalance: Int,
     onToggleBalanceToday: () -> Unit,
+    onManualCvChanged: (Boolean, Double) -> Unit,
     onClearEpeverEnergy: () -> Unit,
     onResetSocDrift: () -> Unit,
     onDeleteOpsLogsBeforeDate: (String) -> String,
     onRefreshOpsLogSummary: () -> Unit,
     unattendedProfile: EpeverBatteryProfile,
+    extendedSettings: EpeverExtendedSettings,
     batteryProfileStatus: String,
     onRefreshBatteryProfile: () -> Unit,
     onUnattendedModeChanged: (Boolean) -> Unit,
     chargeOutputOn: Boolean,
     onChargeOutputChanged: (Boolean) -> Unit,
     onBatteryProfileChanged: (EpeverBatteryProfile, Boolean) -> Unit,
+    onExtendedSettingsChanged: (EpeverExtendedSettings) -> Unit,
     onSyncEpeverClock: () -> Unit,
     onDismissLogStorageWarning: () -> Unit,
     onSilenceLowSocAlarm: () -> Unit,
@@ -1803,6 +1917,7 @@ private fun EpeverApp(
                         onSilenceSocDriftAlarm = onSilenceSocDriftAlarm,
                         onPressureTileClick = onPressureTileClick,
                         onToggleBalanceToday = onToggleBalanceToday,
+                        onManualCvChanged = onManualCvChanged,
                         modifier = Modifier.padding(
                             start = innerPadding.calculateStartPadding(layoutDirection),
                             end = innerPadding.calculateEndPadding(layoutDirection),
@@ -1814,6 +1929,8 @@ private fun EpeverApp(
                 AppTab.Devices -> DevicesScreen(
                     bleState = bmsBleState,
                     epeverState = epeverUsbState,
+                    mppt = state.mppt,
+                    commandCvVolts = state.controller.commandCvVolts,
                     energy = state.energy,
                     onRequestPermissions = onRequestBlePermissions,
                     onStartScan = onStartBmsScan,
@@ -1840,11 +1957,9 @@ private fun EpeverApp(
                 AppTab.Tools -> ToolsScreen(
                     unattendedMode = appSettings.unattendedMode,
                     profile = unattendedProfile,
+                    extended = extendedSettings,
                     epeverConnected = epeverUsbState.connected,
                     epeverClock = epeverUsbState.clock,
-                    deviceProfile = epeverUsbState.deviceProfile,
-                    commandCvVolts = state.controller.commandCvVolts,
-                    lastWriteNote = epeverUsbState.lastWriteNote,
                     mppt = state.mppt,
                     status = batteryProfileStatus,
                     modifier = Modifier.padding(innerPadding),
@@ -1853,6 +1968,7 @@ private fun EpeverApp(
                     chargeOutputOn = chargeOutputOn,
                     onChargeOutputChanged = onChargeOutputChanged,
                     onProfileChanged = onBatteryProfileChanged,
+                    onExtendedChanged = onExtendedSettingsChanged,
                     onSyncClockFromPhone = onSyncEpeverClock,
                     onClearGeneratedEnergy = onClearEpeverEnergy
                 )
@@ -1901,7 +2017,23 @@ private fun AppState.withEpeverTelemetry(usbState: EpeverUsbState): AppState {
             generatedWhYear = telemetry.generatedWhYear,
             generatedWhTotal = telemetry.generatedWhTotal,
             voltageOffset = mppt.voltageOffset,
-            commandCvVolts = mppt.commandCvVolts
+            commandCvVolts = mppt.commandCvVolts,
+            controllerSocPercent = telemetry.controllerSocPercent,
+            systemRatedVolts = telemetry.systemRatedVolts,
+            ratedPvVolts = telemetry.ratedPvVolts,
+            ratedPvAmps = telemetry.ratedPvAmps,
+            ratedPvWatts = telemetry.ratedPvWatts,
+            ratedChargeVolts = telemetry.ratedChargeVolts,
+            ratedChargeAmps = telemetry.ratedChargeAmps,
+            ratedChargeWatts = telemetry.ratedChargeWatts,
+            batteryStatusText = telemetry.batteryStatusText,
+            chargeStatusText = telemetry.chargeStatusText,
+            netBatteryAmps = telemetry.netBatteryAmps,
+            chargingModeText = telemetry.chargingModeText,
+            maxPvVoltsToday = telemetry.maxPvVoltsToday,
+            minPvVoltsToday = telemetry.minPvVoltsToday,
+            maxBatteryVoltsToday = telemetry.maxBatteryVoltsToday,
+            minBatteryVoltsToday = telemetry.minBatteryVoltsToday
         )
     } else {
         mppt

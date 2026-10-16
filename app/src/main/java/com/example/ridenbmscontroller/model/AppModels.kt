@@ -48,7 +48,23 @@ data class MpptState(
     val generatedWhYear: Double = 0.0,
     val generatedWhTotal: Double = 0.0,
     val voltageOffset: Double = 0.0,
-    val commandCvVolts: Double = 0.0
+    val commandCvVolts: Double = 0.0,
+    val controllerSocPercent: Int? = null,
+    val systemRatedVolts: Double? = null,
+    val ratedPvVolts: Double? = null,
+    val ratedPvAmps: Double? = null,
+    val ratedPvWatts: Double? = null,
+    val ratedChargeVolts: Double? = null,
+    val ratedChargeAmps: Double? = null,
+    val ratedChargeWatts: Double? = null,
+    val batteryStatusText: String? = null,
+    val chargeStatusText: String? = null,
+    val netBatteryAmps: Double? = null,
+    val chargingModeText: String? = null,
+    val maxPvVoltsToday: Double = 0.0,
+    val minPvVoltsToday: Double = 0.0,
+    val maxBatteryVoltsToday: Double = 0.0,
+    val minBatteryVoltsToday: Double = 0.0
 )
 
 data class EnergyCounters(
@@ -95,6 +111,7 @@ fun localEpochDay(nowMs: Long = System.currentTimeMillis()): Long {
 
 data class AppSettings(
     val maxBatteryVolts: Double,
+    val maxChargeAmps: Double = 50.0,
     val bmsOfflineMaxBatteryVolts: Double,
     val balanceEveryDays: Int,
     val lastBalanceEpochDay: Long,
@@ -107,11 +124,14 @@ data class AppSettings(
     val bmsVoltageHoldVolts: Double,
     val fullHoldVolts: Double,
     val controllerLoopMs: Int,
+    val voltageWritePeriodS: Int = 5,
     val keepScreenOn: Boolean,
     val logEventsEnabled: Boolean = true,
     val logTelemetryEnabled: Boolean = true,
     val logHistoryEnabled: Boolean = true,
-    val unattendedMode: Boolean = false
+    val unattendedMode: Boolean = false,
+    val manualCvEnabled: Boolean = false,
+    val manualCvVolts: Double = 13.42
 )
 
 data class HistoryPoint(
@@ -192,6 +212,7 @@ data class AppState(
             ),
             settings = AppSettings(
                 maxBatteryVolts = 14.20,
+                maxChargeAmps = 50.0,
                 bmsOfflineMaxBatteryVolts = 14.20,
                 balanceEveryDays = 7,
                 lastBalanceEpochDay = 0L,
@@ -204,6 +225,7 @@ data class AppState(
                 bmsVoltageHoldVolts = 13.42,
                 fullHoldVolts = 14.00,
                 controllerLoopMs = 400,
+                voltageWritePeriodS = 5,
                 keepScreenOn = true
             ),
             history = emptyList(),

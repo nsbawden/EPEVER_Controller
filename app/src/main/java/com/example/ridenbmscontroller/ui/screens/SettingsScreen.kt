@@ -78,6 +78,9 @@ fun SettingsScreen(
             NumberFieldRow("Maximum controller voltage", settings.maxBatteryVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(maxBatteryVolts = it))
             }
+            NumberFieldRow("Max charge current", settings.maxChargeAmps, "A", 0.0, 80.0) {
+                onSettingsChanged(settings.copy(maxChargeAmps = it))
+            }
             NumberFieldRow("Ceiling hold voltage", settings.bmsVoltageHoldVolts, "V", 12.0, 15.0) {
                 onSettingsChanged(settings.copy(bmsVoltageHoldVolts = it))
             }
@@ -90,15 +93,15 @@ fun SettingsScreen(
             IntFieldRow("Low SOC alarm", settings.lowSocAlarmPercent, "%", 0, 100) {
                 onSettingsChanged(settings.copy(lowSocAlarmPercent = it))
             }
-            IntFieldRow("Balance interval", settings.balanceEveryDays, "days", 1, 60) {
+            IntFieldRow("Top-off interval", settings.balanceEveryDays, "days", 1, 60) {
                 onSettingsChanged(settings.copy(balanceEveryDays = it))
             }
             Button(onClick = onToggleBalanceToday, modifier = Modifier.fillMaxWidth()) {
                 Text(
                     if (balanceDayToday) {
-                        "Cancel Balance Today"
+                        "Cancel Top-off Today"
                     } else {
-                        "Force Balance Today (next in ${daysUntilNextBalance}d)"
+                        "Force Top-off Today (next in ${daysUntilNextBalance}d)"
                     }
                 )
             }
@@ -125,6 +128,9 @@ fun SettingsScreen(
         SettingsGroup("Solar control") {
             IntFieldRow("Controller loop", settings.controllerLoopMs, "ms", 100, 2000) {
                 onSettingsChanged(settings.copy(controllerLoopMs = it))
+            }
+            IntFieldRow("Voltage write", settings.voltageWritePeriodS, "s", 1, 30) {
+                onSettingsChanged(settings.copy(voltageWritePeriodS = it))
             }
             ToggleRow("Controller enabled", settings.controllerEnabled) {
                 onSettingsChanged(settings.copy(controllerEnabled = it))

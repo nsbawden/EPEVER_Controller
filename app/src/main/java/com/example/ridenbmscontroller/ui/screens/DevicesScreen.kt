@@ -1,6 +1,7 @@
 package com.example.ridenbmscontroller.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,9 +26,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.ridenbmscontroller.ble.BmsBleDevice
 import com.example.ridenbmscontroller.ble.BmsBleUiState
 import com.example.ridenbmscontroller.model.EnergyCounters
+import com.example.ridenbmscontroller.model.MpptState
 import com.example.ridenbmscontroller.epever.EpeverUsbState
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
 import com.example.ridenbmscontroller.ui.theme.Panel
@@ -39,6 +42,8 @@ import com.example.ridenbmscontroller.ui.theme.WarningOrange
 fun DevicesScreen(
     bleState: BmsBleUiState,
     epeverState: EpeverUsbState,
+    mppt: MpptState,
+    commandCvVolts: Double,
     energy: EnergyCounters,
     onRequestPermissions: () -> Unit,
     onStartScan: () -> Unit,
@@ -48,6 +53,8 @@ fun DevicesScreen(
     modifier: Modifier = Modifier
 ) {
     var showAllDevices by remember { mutableStateOf(false) }
+    val linked = bleState.connectedDeviceName != null && epeverState.connected
+    var setupExpanded by remember { mutableStateOf(false) }
     val batteryLikeDevices = bleState.devices.filter { it.looksLikeBattery }
     val visibleDevices = if (showAllDevices || batteryLikeDevices.isEmpty()) {
         bleState.devices
@@ -65,6 +72,30 @@ fun DevicesScreen(
     ) {
         Text("Devices", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
 
+        if (linked && !setupExpanded) {
+            Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { setupExpanded = true }
+                        .padding(12.dp)
+                ) {
+                    Column {
+                        Text("BMS / USB setup", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "${bleState.connectedDeviceName} · USB online",
+                            color = TextMuted,
+                            fontSize = 13.sp
+                        )
+                    }
+                    Text("Show", color = TextMuted)
+                }
+            }
+        }
+
+        if (!linked || setupExpanded) {
         Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 StatusRow("Bluetooth", if (bleState.bluetoothEnabled) "On" else "Off", bleState.bluetoothEnabled)
@@ -178,6 +209,98 @@ fun DevicesScreen(
                 TelemetryRow("Generated today", "%.0f Wh".format(telemetry.generatedWhToday))
             }
         }
+        if (linked && setupExpanded) {
+            OutlinedButton(onClick = { setupExpanded = false }, modifier = Modifier.fillMaxWidth()) {
+                Text("Hide setup")
+            }
+        }
+        }
+
+        Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Controller telemetry", fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Read-only values from the EPEVER. MPPT V on the dashboard is measured battery voltage, not these setpoints.",
+                    color = TextMuted,
+                    fontSize = 13.sp
+                )
+                val lastWriteNote = epeverState.lastWriteNote
+                if (!lastWriteNote.isNullOrBlank()) {
+                    Text(lastWriteNote, color = WarningOrange, fontSize = 13.sp)
+                }
+                val deviceProfile = epeverState.deviceProfile
+                Text("Live voltages", fontWeight = FontWeight.SemiBold)
+                TelemetryRow(
+                    "MPPT T",
+                    mppt.deviceTempF?.let { "%.0f °F".format(it) } ?: "—"
+                )
+                TelemetryRow(
+                    "RTS T",
+                    mppt.rtsTempF?.let { "%.0f °F".format(it) } ?: "—"
+                )
+                if (deviceProfile == null) {
+                    Text(if (epeverState.connected) "Reading…" else "Disconnected", color = TextMuted)
+                } else {
+                    if (commandCvVolts > 0.0) {
+                        TelemetryRow("App command CV", "%.2f V".format(commandCvVolts))
+                        val deviceCv = deviceProfile.regulationVolts
+                        if (kotlin.math.abs(commandCvVolts - deviceCv) >= 0.05) {
+                            Text(
+                                "EPEVER still at %.2f V — last command did not stick.".format(deviceCv),
+                                color = WarningOrange,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                    TelemetryRow("High voltage disconnect", "%.2f V".format(deviceProfile.highVoltageDisconnect))
+                    TelemetryRow("Charging limit", "%.2f V".format(deviceProfile.chargingLimitVolts))
+                    TelemetryRow("Over voltage reconnect", "%.2f V".format(deviceProfile.overVoltageReconnect))
+                    TelemetryRow("Equalize", "%.2f V".format(deviceProfile.equalizeVolts))
+                    TelemetryRow("Boost", "%.2f V".format(deviceProfile.boostVolts))
+                    TelemetryRow("Float", "%.2f V".format(deviceProfile.floatVolts))
+                    TelemetryRow("Boost reconnect", "%.2f V".format(deviceProfile.boostReconnectVolts))
+                    TelemetryRow("Low voltage reconnect", "%.2f V".format(deviceProfile.lowVoltageReconnect))
+                    TelemetryRow("Under voltage recover", "%.2f V".format(deviceProfile.underVoltageRecover))
+                    TelemetryRow("Under voltage warning", "%.2f V".format(deviceProfile.underVoltageWarning))
+                    TelemetryRow("Low voltage disconnect", "%.2f V".format(deviceProfile.lowVoltageDisconnect))
+                    TelemetryRow("Discharging limit", "%.2f V".format(deviceProfile.dischargingLimitVolts))
+                }
+
+                Text("Status / rated", fontWeight = FontWeight.SemiBold)
+                if (deviceProfile != null) {
+                    TelemetryRow("Battery type", deviceProfile.batteryTypeLabel)
+                    TelemetryRow("Capacity", "${deviceProfile.capacityAh} Ah")
+                    TelemetryRow("Temp compensation", "%.2f mV/°C/2V".format(deviceProfile.tempCompensationMvv))
+                }
+                TelemetryRow("Controller SOC", mppt.controllerSocPercent?.let { "$it %" } ?: "—")
+                TelemetryRow("System rated V", mppt.systemRatedVolts.formatVolts())
+                TelemetryRow("Charging mode", mppt.chargingModeText ?: "—")
+                TelemetryRow("Rated PV", mppt.ratedPvVolts.formatRated(mppt.ratedPvAmps, mppt.ratedPvWatts))
+                TelemetryRow("Rated charge", mppt.ratedChargeVolts.formatRated(mppt.ratedChargeAmps, mppt.ratedChargeWatts))
+                TelemetryRow("Battery status", mppt.batteryStatusText ?: "—")
+                TelemetryRow("Charge status", mppt.chargeStatusText ?: "—")
+                TelemetryRow("Net battery current", mppt.netBatteryAmps?.let { "%.2f A".format(it) } ?: "—")
+
+                val deviceExtended = epeverState.extendedSettings
+                if (deviceExtended != null) {
+                    Text("Extras", fontWeight = FontWeight.SemiBold)
+                    TelemetryRow("Rated battery V", deviceExtended.batteryRatedVoltageLabel)
+                    TelemetryRow("Equalize cycle", "${deviceExtended.equalizeCycleDays} d")
+                    TelemetryRow("Equalize duration", "${deviceExtended.equalizeDurationMin} min")
+                    TelemetryRow("Boost duration", "${deviceExtended.boostDurationMin} min")
+                    TelemetryRow("Charge %", "${deviceExtended.chargePercent} %")
+                    TelemetryRow("Discharge %", "${deviceExtended.dischargePercent} %")
+                    TelemetryRow("Charge management", deviceExtended.chargeManagementLabel)
+                    TelemetryRow("Batt temp warn high", "%.1f °C".format(deviceExtended.batteryTempWarnHighC))
+                    TelemetryRow("Batt temp warn low", "%.1f °C".format(deviceExtended.batteryTempWarnLowC))
+                    TelemetryRow("Inner temp limit", "%.1f °C".format(deviceExtended.innerTempLimitC))
+                    TelemetryRow("Inner temp recover", "%.1f °C".format(deviceExtended.innerTempRecoverC))
+                    TelemetryRow("Power temp limit", "%.1f °C".format(deviceExtended.powerTempLimitC))
+                    TelemetryRow("Power temp recover", "%.1f °C".format(deviceExtended.powerTempRecoverC))
+                    TelemetryRow("Line impedance", "%.2f mΩ".format(deviceExtended.lineImpedanceMOhm))
+                }
+            }
+        }
 
         Surface(color = Panel, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -249,6 +372,18 @@ private fun formatCapacity(remainingAh: Double?, nominalAh: Double?): String {
         nominalAh != null -> "%.2f Ah nominal".format(nominalAh)
         else -> "-"
     }
+}
+
+private fun Double?.formatVolts(): String = this?.takeIf { it > 0.0 }?.let { "%.2f V".format(it) } ?: "—"
+
+private fun Double?.formatRated(amps: Double?, watts: Double?): String {
+    if (this == null && amps == null && watts == null) return "—"
+    val parts = buildList {
+        this@formatRated?.takeIf { it > 0.0 }?.let { add("%.1f V".format(it)) }
+        amps?.takeIf { it > 0.0 }?.let { add("%.1f A".format(it)) }
+        watts?.takeIf { it > 0.0 }?.let { add("%.0f W".format(it)) }
+    }
+    return parts.joinToString(" / ").ifBlank { "—" }
 }
 
 private fun Double.formatWattHoursLong(): String {

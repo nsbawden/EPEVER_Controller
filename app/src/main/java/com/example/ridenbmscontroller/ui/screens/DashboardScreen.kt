@@ -25,6 +25,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -75,7 +76,8 @@ fun DashboardScreen(
     onSilenceLowSocAlarm: () -> Unit = {},
     onSilenceSocDriftAlarm: () -> Unit = {},
     onPressureTileClick: () -> Unit = {},
-    onToggleBalanceToday: () -> Unit = {}
+    onToggleBalanceToday: () -> Unit = {},
+    onManualCvChanged: (enabled: Boolean, volts: Double) -> Unit = { _, _ -> }
 ) {
     Column(
         modifier = modifier
@@ -86,7 +88,7 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         BatteryGaugeCard(state, onSilenceLowSocAlarm, onSilenceSocDriftAlarm)
-        MpptPanel(state, onPressureTileClick, onToggleBalanceToday)
+        MpptPanel(state, onPressureTileClick, onToggleBalanceToday, onManualCvChanged)
     }
 }
 
@@ -356,8 +358,10 @@ private fun SocDriftAlertRow(state: AppState, onSilenceSocDriftAlarm: () -> Unit
 private fun MpptPanel(
     state: AppState,
     onPressureTileClick: () -> Unit,
-    onToggleBalanceToday: () -> Unit
+    onToggleBalanceToday: () -> Unit,
+    onManualCvChanged: (enabled: Boolean, volts: Double) -> Unit
 ) {
+    var showManualCv by remember { mutableStateOf(false) }
     Surface(
         color = Panel,
         shape = RoundedCornerShape(8.dp),
@@ -404,12 +408,18 @@ private fun MpptPanel(
                     VoltageAmber,
                     Modifier.weight(1f)
                 )
+                val displayCv = if (state.settings.manualCvEnabled) {
+                    state.settings.manualCvVolts
+                } else {
+                    state.controller.commandCvVolts
+                }
                 ValueTile(
-                    "MPPT T",
-                    state.mppt.deviceTempF?.let { "%.0f".format(it) } ?: "—",
-                    "F",
-                    WarningOrange,
-                    Modifier.weight(1f)
+                    "CV",
+                    if (displayCv > 0.0) "%.2f".format(displayCv) else "—",
+                    "V",
+                    if (state.settings.manualCvEnabled) WarningOrange else VoltageAmber,
+                    Modifier.weight(1f),
+                    onClick = { showManualCv = true }
                 )
                 val altitudeM = state.gpsAltitudeMeters
                 val stationInHg = state.barometricPressureInHg
@@ -438,13 +448,6 @@ private fun MpptPanel(
                 val today = state.energy.whToday.formatWattHours()
                 ValueTile("PV Today", today.value, today.unit, TextPrimary, Modifier.weight(1f))
                 ValueTile(
-                    "RTS T",
-                    state.mppt.rtsTempF?.let { "%.0f".format(it) } ?: "—",
-                    "F",
-                    WarningOrange,
-                    Modifier.weight(1f)
-                )
-                ValueTile(
                     "SOC Target",
                     state.controller.socTargetPercent.toString(),
                     "%",
@@ -455,6 +458,95 @@ private fun MpptPanel(
             }
         }
     }
+    if (showManualCv) {
+        ManualCvDialog(
+            currentAutoCv = state.controller.commandCvVolts,
+            manualEnabled = state.settings.manualCvEnabled,
+            manualVolts = state.settings.manualCvVolts,
+            onDismiss = { showManualCv = false },
+            onConfirm = { enabled, volts ->
+                onManualCvChanged(enabled, volts)
+                showManualCv = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun ManualCvDialog(
+    currentAutoCv: Double,
+    manualEnabled: Boolean,
+    manualVolts: Double,
+    onDismiss: () -> Unit,
+    onConfirm: (enabled: Boolean, volts: Double) -> Unit
+) {
+    var enabled by remember { mutableStateOf(manualEnabled) }
+    val seed = when {
+        manualEnabled -> manualVolts
+        currentAutoCv > 0.0 -> currentAutoCv
+        else -> manualVolts
+    }
+    var text by remember { mutableStateOf("%.2f".format(seed)) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Charge CV") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Manual", fontWeight = FontWeight.SemiBold)
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { on ->
+                            enabled = on
+                            if (on && !manualEnabled) {
+                                val auto = if (currentAutoCv > 0.0) currentAutoCv else manualVolts
+                                text = "%.2f".format(auto)
+                            }
+                        }
+                    )
+                }
+                if (enabled) {
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        label = { Text("CV") },
+                        suffix = { Text("V") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Decimal,
+                            imeAction = ImeAction.Done
+                        )
+                    )
+                    Text(
+                        "Sent as Boost, Equalize, and Float. The value you set is what is written.",
+                        color = TextMuted,
+                        fontSize = 13.sp
+                    )
+                } else {
+                    Text(
+                        "Live loop sets Boost, Equalize, and Float together.",
+                        color = TextMuted,
+                        fontSize = 13.sp
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val volts = text.toDoubleOrNull() ?: seed
+                    onConfirm(enabled, volts)
+                }
+            ) { Text("OK") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 @Composable
@@ -592,7 +684,16 @@ private fun harvestLimit(state: AppState): HarvestLimit {
         ?: state.settings.bmsVoltageHoldVolts
     val atHoldVoltage = mode == "Hold" && state.battery.volts >= holdTarget - 0.02
     val atCommandedCv = commandedCv > 0.0 && commandedCv - mpptVolts <= 0.08
+    val iMax = state.settings.maxChargeAmps
+    val live = mode == "Bulk" || mode == "Hold" || mode == "Top-up"
+    val policyCv = if (mode == "Hold" || mode == "Top-up") holdTarget else state.settings.maxBatteryVolts
+    val chargeAmps = state.battery.amps.coerceAtLeast(0.0)
+    val limiting = live &&
+        !state.settings.manualCvEnabled &&
+        iMax > 0.0 &&
+        (chargeAmps >= iMax || (commandedCv > 0.0 && commandedCv < policyCv - 0.05))
     return when {
+        limiting -> HarvestLimit("%.0f A".format(iMax), WarningOrange)
         noSun -> HarvestLimit("Night", TextMuted)
         mode == "Off" && pushing -> HarvestLimit("Array", BatteryGreen)
         mode == "Off" || (mode == "Alarm" && !pushing) -> HarvestLimit("Off", DeviceRed)

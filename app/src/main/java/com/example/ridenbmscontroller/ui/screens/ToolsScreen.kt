@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ridenbmscontroller.epever.EpeverBatteryProfile
 import com.example.ridenbmscontroller.epever.EpeverClock
+import com.example.ridenbmscontroller.epever.EpeverExtendedSettings
 import com.example.ridenbmscontroller.model.MpptState
 import com.example.ridenbmscontroller.ui.theme.BatteryGreen
 import com.example.ridenbmscontroller.ui.theme.Panel
@@ -49,11 +50,9 @@ import kotlinx.coroutines.delay
 fun ToolsScreen(
     unattendedMode: Boolean,
     profile: EpeverBatteryProfile,
+    extended: EpeverExtendedSettings,
     epeverConnected: Boolean,
     epeverClock: EpeverClock?,
-    deviceProfile: EpeverBatteryProfile?,
-    commandCvVolts: Double,
-    lastWriteNote: String?,
     mppt: MpptState,
     status: String,
     modifier: Modifier = Modifier,
@@ -62,6 +61,7 @@ fun ToolsScreen(
     chargeOutputOn: Boolean,
     onChargeOutputChanged: (Boolean) -> Unit,
     onProfileChanged: (EpeverBatteryProfile, writeToEpever: Boolean) -> Unit,
+    onExtendedChanged: (EpeverExtendedSettings) -> Unit,
     onSyncClockFromPhone: () -> Unit,
     onClearGeneratedEnergy: () -> Unit
 ) {
@@ -154,47 +154,6 @@ fun ToolsScreen(
             )
         }
 
-        ProfileGroup("Controller settings (live)") {
-            Text(
-                "Read-only values from the EPEVER. MPPT V on the dashboard is measured battery voltage, not these setpoints.",
-                color = TextMuted,
-                fontSize = 13.sp
-            )
-            if (!lastWriteNote.isNullOrBlank()) {
-                Text(lastWriteNote, color = WarningOrange, fontSize = 13.sp)
-            }
-            if (deviceProfile == null) {
-                Text(if (epeverConnected) "Reading…" else "Disconnected", color = TextMuted)
-            } else {
-                ClockRow("Battery type", deviceProfile.batteryTypeLabel)
-                ClockRow("Capacity", "${deviceProfile.capacityAh} Ah")
-                ClockRow("Temp compensation", "%.2f mV/°C/2V".format(deviceProfile.tempCompensationMvv))
-                if (commandCvVolts > 0.0) {
-                    ClockRow("App command CV", "%.2f V".format(commandCvVolts))
-                    val deviceCv = deviceProfile.regulationVolts
-                    if (kotlin.math.abs(commandCvVolts - deviceCv) >= 0.05) {
-                        Text(
-                            "EPEVER still at %.2f V — last command did not stick.".format(deviceCv),
-                            color = WarningOrange,
-                            fontSize = 13.sp
-                        )
-                    }
-                }
-                ClockRow("High voltage disconnect", "%.2f V".format(deviceProfile.highVoltageDisconnect))
-                ClockRow("Charging limit", "%.2f V".format(deviceProfile.chargingLimitVolts))
-                ClockRow("Over voltage reconnect", "%.2f V".format(deviceProfile.overVoltageReconnect))
-                ClockRow("Equalize", "%.2f V".format(deviceProfile.equalizeVolts))
-                ClockRow("Boost", "%.2f V".format(deviceProfile.boostVolts))
-                ClockRow("Float", "%.2f V".format(deviceProfile.floatVolts))
-                ClockRow("Boost reconnect", "%.2f V".format(deviceProfile.boostReconnectVolts))
-                ClockRow("Low voltage reconnect", "%.2f V".format(deviceProfile.lowVoltageReconnect))
-                ClockRow("Under voltage recover", "%.2f V".format(deviceProfile.underVoltageRecover))
-                ClockRow("Under voltage warning", "%.2f V".format(deviceProfile.underVoltageWarning))
-                ClockRow("Low voltage disconnect", "%.2f V".format(deviceProfile.lowVoltageDisconnect))
-                ClockRow("Discharging limit", "%.2f V".format(deviceProfile.dischargingLimitVolts))
-            }
-        }
-
         ProfileGroup("Controller clock") {
             ClockRow("EPEVER", epeverClock?.takeIf { it.valid }?.format() ?: if (epeverConnected) "Reading…" else "Disconnected")
             ClockRow("Phone", phoneClock.format())
@@ -217,6 +176,10 @@ fun ToolsScreen(
             ClockRow("This month", mppt.generatedWhMonth.formatWattHoursLong())
             ClockRow("This year", mppt.generatedWhYear.formatWattHoursLong())
             ClockRow("Total", mppt.generatedWhTotal.formatWattHoursLong())
+            ClockRow("Max PV today", mppt.maxPvVoltsToday.formatVolts())
+            ClockRow("Min PV today", mppt.minPvVoltsToday.formatVolts())
+            ClockRow("Max battery today", mppt.maxBatteryVoltsToday.formatVolts())
+            ClockRow("Min battery today", mppt.minBatteryVoltsToday.formatVolts())
             Text(
                 if (epeverConnected) status else "EPEVER disconnected",
                 color = TextMuted,
@@ -246,6 +209,36 @@ fun ToolsScreen(
             NumberField("Temp compensation", profile.tempCompensationMvv, "mV/°C/2V", 0.0, 9.0) {
                 onProfileChanged(profile.copy(tempCompensationMvv = it), true)
             }
+            CycleRow("Rated battery V", extended.batteryRatedVoltageLabel) {
+                onExtendedChanged(
+                    extended.copy(
+                        batteryRatedVoltageCode = EpeverExtendedSettings.nextRatedVoltageCode(
+                            extended.batteryRatedVoltageCode
+                        )
+                    )
+                )
+            }
+            NumberField("Batt temp warn high", extended.batteryTempWarnHighC, "°C", 0.0, 90.0) {
+                onExtendedChanged(extended.copy(batteryTempWarnHighC = it))
+            }
+            NumberField("Batt temp warn low", extended.batteryTempWarnLowC, "°C", -40.0, 10.0) {
+                onExtendedChanged(extended.copy(batteryTempWarnLowC = it))
+            }
+            NumberField("Inner temp limit", extended.innerTempLimitC, "°C", 40.0, 100.0) {
+                onExtendedChanged(extended.copy(innerTempLimitC = it))
+            }
+            NumberField("Inner temp recover", extended.innerTempRecoverC, "°C", 30.0, 95.0) {
+                onExtendedChanged(extended.copy(innerTempRecoverC = it))
+            }
+            NumberField("Power temp limit", extended.powerTempLimitC, "°C", 40.0, 100.0) {
+                onExtendedChanged(extended.copy(powerTempLimitC = it))
+            }
+            NumberField("Power temp recover", extended.powerTempRecoverC, "°C", 30.0, 95.0) {
+                onExtendedChanged(extended.copy(powerTempRecoverC = it))
+            }
+            NumberField("Line impedance", extended.lineImpedanceMOhm, "mΩ", 0.0, 200.0) {
+                onExtendedChanged(extended.copy(lineImpedanceMOhm = it))
+            }
         }
 
         ProfileGroup(if (unattendedMode) "Charge voltages" else "Unattended charge voltages") {
@@ -258,9 +251,6 @@ fun ToolsScreen(
             NumberField("Over voltage reconnect", profile.overVoltageReconnect, "V", 12.0, 15.0) {
                 onProfileChanged(profile.copy(overVoltageReconnect = it), unattendedMode)
             }
-            NumberField("Equalize", profile.equalizeVolts, "V", 12.0, 15.0) {
-                onProfileChanged(profile.copy(equalizeVolts = it), unattendedMode)
-            }
             NumberField("Boost", profile.boostVolts, "V", 12.0, 15.0) {
                 onProfileChanged(profile.copy(boostVolts = it), unattendedMode)
             }
@@ -269,6 +259,32 @@ fun ToolsScreen(
             }
             NumberField("Boost reconnect", profile.boostReconnectVolts, "V", 12.0, 15.0) {
                 onProfileChanged(profile.copy(boostReconnectVolts = it), unattendedMode)
+            }
+            IntField("Boost duration", extended.boostDurationMin, "min", 10, 180) {
+                onExtendedChanged(extended.copy(boostDurationMin = it))
+            }
+            IntField("Charge percent", extended.chargePercent, "%", 0, 100) {
+                onExtendedChanged(extended.copy(chargePercent = it))
+            }
+            CycleRow("Charge management", extended.chargeManagementLabel) {
+                onExtendedChanged(extended.copy(chargeManagementSoc = !extended.chargeManagementSoc))
+            }
+        }
+
+        ProfileGroup("Equalize") {
+            Text(
+                "Duration 0 min disables Equalize (BMS already balances). Cycle and voltage are unused while duration is 0. Keep voltage at or below Charging limit — do not set it to 0 V.",
+                color = TextMuted,
+                fontSize = 13.sp
+            )
+            NumberField("Equalize voltage", profile.equalizeVolts, "V", 12.0, 15.0) {
+                onProfileChanged(profile.copy(equalizeVolts = it), unattendedMode)
+            }
+            IntField("Equalize duration", extended.equalizeDurationMin, "min", 0, 180) {
+                onExtendedChanged(extended.copy(equalizeDurationMin = it))
+            }
+            IntField("Equalize cycle", extended.equalizeCycleDays, "d", 0, 255) {
+                onExtendedChanged(extended.copy(equalizeCycleDays = it))
             }
         }
 
@@ -287,6 +303,9 @@ fun ToolsScreen(
             }
             NumberField("Discharging limit", profile.dischargingLimitVolts, "V", 10.0, 14.0) {
                 onProfileChanged(profile.copy(dischargingLimitVolts = it), true)
+            }
+            IntField("Discharge percent", extended.dischargePercent, "%", 0, 100) {
+                onExtendedChanged(extended.copy(dischargePercent = it))
             }
         }
     }
@@ -320,6 +339,22 @@ private fun ClockRow(label: String, value: String) {
     ) {
         Text(label, color = TextMuted)
         Text(value, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+private fun Double?.formatVolts(): String = this?.takeIf { it > 0.0 }?.let { "%.2f V".format(it) } ?: "—"
+
+@Composable
+private fun CycleRow(label: String, value: String, onCycle: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(label, color = TextMuted, modifier = Modifier.weight(1f))
+        Button(onClick = onCycle) {
+            Text(value)
+        }
     }
 }
 

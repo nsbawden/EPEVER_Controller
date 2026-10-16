@@ -52,6 +52,11 @@ import kotlin.math.abs
  * boostReconnect must be > LVR + 0.02 V or the block is rejected.
  * Input 0x3104 is measured battery voltage (dashboard MPPT V), not commanded CV.
  * Energy words are 0.01 kWh.
+ *
+ * Non-load extras (temps, rated-V code, EQ/Boost minutes, charge/discharge %,
+ * voltage-vs-SOC management) live outside 0x9000–0x900E and are written as their
+ * own FC10 groups. Tracer-AN 80A has no load terminals — skip 0x0002–0x0006 coils,
+ * 0x901E–0x9021 / 0x903D–0x906A load timers, and consumed-energy-by-load.
  */
 class EpeverUsbMonitor(
     context: Context,
@@ -67,6 +72,7 @@ class EpeverUsbMonitor(
     private var currentIo: ModbusIo? = null
     private val ioMutex = Mutex()
     private var parkedProfile: EpeverBatteryProfile? = null
+    private var lastTelemetry = EpeverTelemetry()
 
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -157,18 +163,24 @@ class EpeverUsbMonitor(
                     var sampleSeq = 0L
                     while (isActive) {
                         val snapshot = ioMutex.withLock {
-                            val nextTelemetry = readTelemetry(io)
-                            val nextClock = if (sampleSeq % 5L == 0L) {
-                                runCatching { readClock(io) }.getOrNull()
-                            } else {
-                                null
-                            }
-                            val nextProfile = if (sampleSeq % 5L == 2L) {
-                                runCatching { readBatteryProfile(io) }.getOrNull()
-                            } else {
-                                null
-                            }
-                            Triple(nextTelemetry, nextClock, nextProfile)
+                            PollSnapshot(
+                                telemetry = readTelemetry(io, includeRated = sampleSeq % 5L == 2L),
+                                clock = if (sampleSeq % 5L == 0L) {
+                                    runCatching { readClock(io) }.getOrNull()
+                                } else {
+                                    null
+                                },
+                                profile = if (sampleSeq % 5L == 2L) {
+                                    runCatching { readBatteryProfile(io) }.getOrNull()
+                                } else {
+                                    null
+                                },
+                                extended = if (sampleSeq % 5L == 2L) {
+                                    runCatching { readExtendedSettings(io) }.getOrNull()
+                                } else {
+                                    null
+                                }
+                            )
                         }
                         sampleSeq += 1L
                         publishOnMain(
@@ -176,10 +188,11 @@ class EpeverUsbMonitor(
                                 connected = true,
                                 permissionNeeded = false,
                                 status = "EPEVER live",
-                                telemetry = snapshot.first,
+                                telemetry = snapshot.telemetry,
                                 telemetrySampleSeq = sampleSeq,
-                                clock = snapshot.second ?: state.clock,
-                                deviceProfile = snapshot.third ?: state.deviceProfile,
+                                clock = snapshot.clock ?: state.clock,
+                                deviceProfile = snapshot.profile ?: state.deviceProfile,
+                                extendedSettings = snapshot.extended ?: state.extendedSettings,
                                 lastWriteNote = state.lastWriteNote
                             )
                         )
@@ -305,11 +318,22 @@ class EpeverUsbMonitor(
                 return@launch
             }
             val result = runCatching {
-                ioMutex.withLock { readBatteryProfile(io) }
+                ioMutex.withLock {
+                    val profile = readBatteryProfile(io)
+                    val extended = runCatching { readExtendedSettings(io) }.getOrNull()
+                    profile to extended
+                }
             }
             withContext(Dispatchers.Main) {
-                result.onSuccess { publish(state.copy(deviceProfile = it)) }
-                onResult(result)
+                result.onSuccess { (profile, extended) ->
+                    publish(
+                        state.copy(
+                            deviceProfile = profile,
+                            extendedSettings = extended ?: state.extendedSettings
+                        )
+                    )
+                }
+                onResult(result.map { it.first })
             }
         }
     }
@@ -328,6 +352,25 @@ class EpeverUsbMonitor(
                 ioMutex.withLock { writeBatteryProfile(io, profile) }
             }
             withContext(Dispatchers.Main) { onResult(result) }
+        }
+    }
+
+    fun writeExtendedSettings(settings: EpeverExtendedSettings, onResult: (Result<Unit>) -> Unit = {}) {
+        scope.launch(Dispatchers.IO) {
+            val io = currentIo
+            if (io == null) {
+                withContext(Dispatchers.Main) {
+                    onResult(Result.failure(IllegalStateException("EPEVER not connected")))
+                }
+                return@launch
+            }
+            val result = runCatching {
+                ioMutex.withLock { writeExtendedSettings(io, settings) }
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess { publish(state.copy(extendedSettings = settings)) }
+                onResult(result)
+            }
         }
     }
 
@@ -521,13 +564,105 @@ class EpeverUsbMonitor(
         return EpeverClock.fromRegisters(io.readHoldingRegs(SLAVE_ID, REG_RTC, 3))
     }
 
-    private suspend fun readTelemetry(io: ModbusIo): EpeverTelemetry {
+    private suspend fun readExtendedSettings(io: ModbusIo): EpeverExtendedSettings {
+        val previous = state.extendedSettings ?: EpeverExtendedSettings()
+        val eqCycle = runCatching { io.readHoldingRegs(SLAVE_ID, REG_EQUALIZE_CYCLE, 1) }.getOrNull()
+        val temps = runCatching { io.readHoldingRegs(SLAVE_ID, REG_TEMP_LIMITS, 7) }.getOrNull()
+        val ratedCode = runCatching { io.readHoldingRegs(SLAVE_ID, REG_BATTERY_RATED_V, 1) }.getOrNull()
+        val durations = runCatching { io.readHoldingRegs(SLAVE_ID, REG_CHARGE_DURATIONS, 4) }.getOrNull()
+        val management = runCatching { io.readHoldingRegs(SLAVE_ID, REG_CHARGE_MANAGEMENT, 1) }.getOrNull()
+        if (eqCycle == null && temps == null && ratedCode == null && durations == null && management == null) {
+            error("No extended settings registers responded")
+        }
+        return EpeverExtendedSettings(
+            equalizeCycleDays = eqCycle?.get(0)?.and(0xFFFF) ?: previous.equalizeCycleDays,
+            batteryTempWarnHighC = temps?.get(0)?.let { fromRegTempC(it) } ?: previous.batteryTempWarnHighC,
+            batteryTempWarnLowC = temps?.get(1)?.let { fromRegTempC(it) } ?: previous.batteryTempWarnLowC,
+            innerTempLimitC = temps?.get(2)?.let { fromRegTempC(it) } ?: previous.innerTempLimitC,
+            innerTempRecoverC = temps?.get(3)?.let { fromRegTempC(it) } ?: previous.innerTempRecoverC,
+            powerTempLimitC = temps?.get(4)?.let { fromRegTempC(it) } ?: previous.powerTempLimitC,
+            powerTempRecoverC = temps?.get(5)?.let { fromRegTempC(it) } ?: previous.powerTempRecoverC,
+            lineImpedanceMOhm = temps?.get(6)?.let { fromRegMilliOhm(it) } ?: previous.lineImpedanceMOhm,
+            batteryRatedVoltageCode = ratedCode?.get(0)?.and(0xFFFF) ?: previous.batteryRatedVoltageCode,
+            equalizeDurationMin = durations?.get(0)?.and(0xFFFF) ?: previous.equalizeDurationMin,
+            boostDurationMin = durations?.get(1)?.and(0xFFFF) ?: previous.boostDurationMin,
+            dischargePercent = durations?.get(2)?.and(0xFFFF) ?: previous.dischargePercent,
+            chargePercent = durations?.get(3)?.and(0xFFFF) ?: previous.chargePercent,
+            chargeManagementSoc = management?.get(0)?.let { (it and 0xFFFF) != 0 } ?: previous.chargeManagementSoc
+        )
+    }
+
+    private suspend fun writeExtendedSettings(io: ModbusIo, settings: EpeverExtendedSettings) {
+        val failures = mutableListOf<String>()
+        runCatching {
+            io.writeHoldingRegs(SLAVE_ID, REG_EQUALIZE_CYCLE, intArrayOf(settings.equalizeCycleDays.coerceIn(0, 255)))
+        }.onFailure { failures += "eq-cycle" }
+        runCatching {
+            io.writeHoldingRegs(
+                SLAVE_ID,
+                REG_TEMP_LIMITS,
+                intArrayOf(
+                    toRegTempC(settings.batteryTempWarnHighC),
+                    toRegTempC(settings.batteryTempWarnLowC),
+                    toRegTempC(settings.innerTempLimitC),
+                    toRegTempC(settings.innerTempRecoverC),
+                    toRegTempC(settings.powerTempLimitC),
+                    toRegTempC(settings.powerTempRecoverC),
+                    toRegMilliOhm(settings.lineImpedanceMOhm)
+                )
+            )
+        }.onFailure { failures += "temps" }
+        runCatching {
+            io.writeHoldingRegs(
+                SLAVE_ID,
+                REG_BATTERY_RATED_V,
+                intArrayOf(settings.batteryRatedVoltageCode.coerceIn(0, 4))
+            )
+        }.onFailure { failures += "rated-V" }
+        runCatching {
+            io.writeHoldingRegs(
+                SLAVE_ID,
+                REG_CHARGE_DURATIONS,
+                intArrayOf(
+                    settings.equalizeDurationMin.coerceIn(0, 180),
+                    settings.boostDurationMin.coerceIn(10, 180),
+                    settings.dischargePercent.coerceIn(0, 100),
+                    settings.chargePercent.coerceIn(0, 100)
+                )
+            )
+        }.onFailure { failures += "durations" }
+        runCatching {
+            io.writeHoldingRegs(
+                SLAVE_ID,
+                REG_CHARGE_MANAGEMENT,
+                intArrayOf(if (settings.chargeManagementSoc) 1 else 0)
+            )
+        }.onFailure { failures += "mgmt" }
+        val required = failures.filter { it == "eq-cycle" || it == "temps" }
+        if (required.isNotEmpty()) {
+            error("Extended write failed: ${required.joinToString()}")
+        }
+    }
+
+    private suspend fun readTelemetry(io: ModbusIo, includeRated: Boolean = false): EpeverTelemetry {
         val rt = io.readInputRegs(SLAVE_ID, REG_REALTIME, 18)
-        val status = io.readInputRegs(SLAVE_ID, REG_CHARGING_STATUS, 1)
+        val status = io.readInputRegs(SLAVE_ID, REG_BATTERY_STATUS, 2)
         val stats = io.readInputRegs(SLAVE_ID, REG_STATS, 20)
-        val chargingStatus = status[0]
+        val socBlock = runCatching { io.readInputRegs(SLAVE_ID, REG_BATTERY_SOC, 4) }.getOrNull()
+        val rated = if (includeRated) {
+            runCatching { io.readInputRegs(SLAVE_ID, REG_RATED, 9) }.getOrNull()
+        } else {
+            null
+        }
+        val net = if (includeRated) {
+            runCatching { io.readInputRegs(SLAVE_ID, REG_NET_BATTERY_A, 2) }.getOrNull()
+        } else {
+            null
+        }
+        val batteryStatus = status[0]
+        val chargingStatus = status[1]
         val stageBits = (chargingStatus ushr 2) and 0x03
-        return EpeverTelemetry(
+        val next = EpeverTelemetry(
             pvVolts = fromRegV(rt[0]),
             pvAmps = fromRegA(rt[1]),
             pvWatts = fromDwordW(rt[2], rt[3]),
@@ -555,8 +690,22 @@ class EpeverUsbMonitor(
             maxPvVoltsToday = fromRegV(stats[0]),
             minPvVoltsToday = fromRegV(stats[1]),
             maxBatteryVoltsToday = fromRegV(stats[2]),
-            minBatteryVoltsToday = fromRegV(stats[3])
+            minBatteryVoltsToday = fromRegV(stats[3]),
+            controllerSocPercent = socBlock?.get(0)?.and(0xFFFF),
+            systemRatedVolts = socBlock?.get(3)?.let { fromRegV(it) } ?: lastTelemetry.systemRatedVolts,
+            ratedPvVolts = rated?.get(0)?.let { fromRegV(it) } ?: lastTelemetry.ratedPvVolts,
+            ratedPvAmps = rated?.get(1)?.let { fromRegA(it) } ?: lastTelemetry.ratedPvAmps,
+            ratedPvWatts = rated?.let { fromDwordW(it[2], it[3]) } ?: lastTelemetry.ratedPvWatts,
+            ratedChargeVolts = rated?.get(4)?.let { fromRegV(it) } ?: lastTelemetry.ratedChargeVolts,
+            ratedChargeAmps = rated?.get(5)?.let { fromRegA(it) } ?: lastTelemetry.ratedChargeAmps,
+            ratedChargeWatts = rated?.let { fromDwordW(it[6], it[7]) } ?: lastTelemetry.ratedChargeWatts,
+            chargingModeText = rated?.get(8)?.let { chargingModeLabel(it) } ?: lastTelemetry.chargingModeText,
+            batteryStatusText = decodeBatteryStatus(batteryStatus),
+            chargeStatusText = decodeChargeStatusExtra(chargingStatus),
+            netBatteryAmps = net?.let { fromDwordA(it[0], it[1]) } ?: lastTelemetry.netBatteryAmps
         )
+        lastTelemetry = next
+        return next
     }
 
     private fun findDriver(preferredVid: Int?, preferredPid: Int?): UsbSerialDriver? {
@@ -634,11 +783,19 @@ class EpeverUsbMonitor(
         private const val PARK_CHARGE_VOLTS = 13.00
         /** 0x3104 in this block is measured battery V (dashboard MPPT V). */
         private const val REG_REALTIME = 0x3100
-        private const val REG_CHARGING_STATUS = 0x3201
+        private const val REG_RATED = 0x3000
+        private const val REG_BATTERY_SOC = 0x311A
+        private const val REG_BATTERY_STATUS = 0x3200
         private const val REG_STATS = 0x3300
+        private const val REG_NET_BATTERY_A = 0x331B
         /** Start of the 15-register battery block that must be written atomically. */
         private const val REG_BATTERY_TYPE = 0x9000
         private const val REG_RTC = 0x9013
+        private const val REG_EQUALIZE_CYCLE = 0x9016
+        private const val REG_TEMP_LIMITS = 0x9017
+        private const val REG_BATTERY_RATED_V = 0x9067
+        private const val REG_CHARGE_DURATIONS = 0x906B
+        private const val REG_CHARGE_MANAGEMENT = 0x9070
 
         private fun toRegV(volts: Double): Int = kotlin.math.round(volts * 100.0).toInt().coerceIn(0, 1500)
         private fun fromRegV(raw: Int): Double = (raw and 0xFFFF) / 100.0
@@ -677,6 +834,19 @@ class EpeverUsbMonitor(
             val value = ((high and 0xFFFF) shl 16) or (low and 0xFFFF)
             return value / 100.0
         }
+        private fun fromDwordA(low: Int, high: Int): Double {
+            val value = ((high and 0xFFFF) shl 16) or (low and 0xFFFF)
+            return value / 100.0
+        }
+        private fun toRegTempC(celsius: Double): Int = (celsius * 100.0).toInt().and(0xFFFF)
+        private fun toRegMilliOhm(value: Double): Int = kotlin.math.round(value * 100.0).toInt().coerceIn(0, 65535)
+        private fun fromRegMilliOhm(raw: Int): Double = (raw and 0xFFFF) / 100.0
+        private fun chargingModeLabel(raw: Int): String = when (raw and 0xFFFF) {
+            0 -> "Connect/Disconnect"
+            1 -> "PWM"
+            2 -> "MPPT"
+            else -> "Mode $raw"
+        }
         private fun fromEnergyWh(low: Int, high: Int): Double {
             val value = ((high and 0xFFFF) shl 16) or (low and 0xFFFF)
             return value * 10.0
@@ -688,3 +858,10 @@ class EpeverUsbMonitor(
         private fun cToF(celsius: Double): Double = celsius * 9.0 / 5.0 + 32.0
     }
 }
+
+private data class PollSnapshot(
+    val telemetry: EpeverTelemetry,
+    val clock: EpeverClock?,
+    val profile: EpeverBatteryProfile?,
+    val extended: EpeverExtendedSettings?
+)
